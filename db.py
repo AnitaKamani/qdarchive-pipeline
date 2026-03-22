@@ -1,5 +1,7 @@
+import shutil
 import sqlite3
 from contextlib import contextmanager
+from pathlib import Path
 
 DB_PATH = "qdarchive.db"
 
@@ -81,7 +83,10 @@ def truncate_db():
             DELETE FROM files;
             DELETE FROM projects;
         """)
-    print("DB truncated.")
+    downloads = Path("downloads")
+    if downloads.exists():
+        shutil.rmtree(downloads)
+    print("DB and downloads/ truncated.")
 
 
 # ── insert helpers ────────────────────────────────────────────────────────────

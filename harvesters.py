@@ -1,6 +1,10 @@
+import re
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+CET = ZoneInfo("Europe/Berlin")
 
 import requests
 import db
@@ -34,7 +38,7 @@ class BaseHarvester:
         return None
 
     def _now(self) -> str:
-        return datetime.now(timezone.utc).isoformat()
+        return datetime.now(CET).isoformat()
 
     def _project_folder(self, project_url: str) -> str:
         return project_url.rstrip("/").split("/")[-1] if project_url else "unknown"
@@ -42,10 +46,12 @@ class BaseHarvester:
     def _dest_dir(self, project_folder: str) -> Path:
         return Path(DOWNLOAD_ROOT) / self.repo_folder / project_folder
 
-    def _save_file(self, conn, project_id: int, url: str, file_name: str, dest_dir: Path):
+    def _save_file(self, conn, project_id: int, url: str, file_name: str, dest_dir: Path,
+                   max_bytes: int | None = None):
+        cap       = max_bytes if max_bytes is not None else MAX_FILE_BYTES
         file_type = Path(file_name).suffix.lstrip(".").lower() or "unknown"
         dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / file_name
+        dest   = dest_dir / file_name
         status = "FAILED_SERVER_UNRESPONSIVE"
         try:
             resp = self.session.get(url, stream=True, timeout=60)
@@ -57,7 +63,7 @@ class BaseHarvester:
                 with open(dest, "wb") as f:
                     for chunk in resp.iter_content(8192):
                         size += len(chunk)
-                        if size > MAX_FILE_BYTES:
+                        if cap and size > cap:
                             dest.unlink(missing_ok=True)
                             status = "FAILED_TOO_LARGE"
                             break
@@ -127,7 +133,7 @@ class OAIHarvester(BaseHarvester):
         print(f"  Done. {len(ids)} projects from {self.repo_url}")
         return ids
 
-    def download_projects(self, project_ids: list[int]):
+    def download_projects(self, project_ids: list[int], max_file_bytes: int | None = None):
         print(f"\n[OAI Download] {len(project_ids)} projects from {self.repo_url}")
         base = self.repo_url.rstrip("/")
 
@@ -139,33 +145,20 @@ class OAIHarvester(BaseHarvester):
             if not row or not row["project_url"]:
                 continue
 
-            handle_path = row["project_url"].split("/handle/")[-1]
             try:
-                # DSpace REST: resolve handle → item UUID
-                item_resp = self.session.get(
-                    f"{base}/rest/handle/{handle_path}",
-                    headers={"Accept": "application/json"}, timeout=30,
-                )
-                item_resp.raise_for_status()
-                uuid = item_resp.json().get("uuid")
-                if not uuid:
-                    continue
-
-                # Get bitstreams list
-                bs_resp = self.session.get(
-                    f"{base}/rest/items/{uuid}/bitstreams",
-                    headers={"Accept": "application/json"}, timeout=30,
-                )
-                bs_resp.raise_for_status()
-                bitstreams = bs_resp.json()
+                resp = self.session.get(row["project_url"], timeout=30)
+                resp.raise_for_status()
+                paths = list(dict.fromkeys(
+                    re.findall(r'href="(/bitstream/[^"?]+)"', resp.text)
+                ))
 
                 dest_dir = self._dest_dir(row["download_project_folder"])
-                print(f"  Project {pid} — {len(bitstreams)} file(s)")
+                print(f"  Project {pid} — {len(paths)} file(s)")
                 with db.get_conn() as conn:
-                    for bs in bitstreams:
-                        name   = bs.get("name", f"file_{bs.get('uuid','?')}")
-                        dl_url = f"{base}/rest/bitstreams/{bs['uuid']}/retrieve"
-                        self._save_file(conn, pid, dl_url, name, dest_dir)
+                    for path in paths:
+                        name   = path.split("/")[-1]
+                        dl_url = f"{base}{path}"
+                        self._save_file(conn, pid, dl_url, name, dest_dir, max_file_bytes)
 
             except Exception as e:
                 print(f"  ! Project {pid} error: {e}")
@@ -274,7 +267,7 @@ class DataverseHarvester(BaseHarvester):
         print(f"  Done. {len(ids)} projects from {self.repo_url}")
         return ids
 
-    def download_projects(self, project_ids: list[int]):
+    def download_projects(self, project_ids: list[int], max_file_bytes: int | None = None):
         print(f"\n[Dataverse Download] {len(project_ids)} projects from {self.repo_url}")
 
         for pid in project_ids:
@@ -297,12 +290,12 @@ class DataverseHarvester(BaseHarvester):
                 dest_dir = self._dest_dir(row["download_project_folder"])
                 print(f"  Project {pid} — {len(files)} file(s)")
                 with db.get_conn() as conn:
-                    for f in files:
-                        df      = f.get("dataFile", {})
+                    for entry in files:
+                        df      = entry.get("dataFile", {})
                         file_id = df.get("id")
                         name    = df.get("filename", f"file_{file_id}")
                         dl_url  = f"{self.api_base}/api/access/datafile/{file_id}"
-                        self._save_file(conn, pid, dl_url, name, dest_dir)
+                        self._save_file(conn, pid, dl_url, name, dest_dir, max_file_bytes)
 
             except Exception as e:
                 print(f"  ! Project {pid} error: {e}")
