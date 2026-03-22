@@ -83,6 +83,16 @@ class BaseHarvester:
             resp = self.session.get(url, stream=True, timeout=(10, 60))
             if resp.status_code in (401, 403):
                 status = "FAILED_LOGIN_REQUIRED"
+                file_size = known_size
+                if file_size is None:
+                    print('shit\n\n\n\n\n')
+                    try:
+                        r = self.session.head(url, timeout=(10, 15), allow_redirects=True)
+                        cl = r.headers.get("content-length")
+                        if cl:
+                            file_size = int(cl)
+                    except Exception:
+                        pass
             else:
                 resp.raise_for_status()
                 # Check Content-Length header before streaming
