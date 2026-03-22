@@ -47,33 +47,67 @@ class BaseHarvester:
         return Path(DOWNLOAD_ROOT) / self.repo_folder / project_folder
 
     def _save_file(self, conn, project_id: int, url: str, file_name: str, dest_dir: Path,
-                   max_bytes: int | None = None):
+                   max_bytes: int | None = None, known_size: int | None = None, download: bool = True):
         cap       = max_bytes if max_bytes is not None else MAX_FILE_BYTES
         file_type = Path(file_name).suffix.lstrip(".").lower() or "unknown"
+
+        if not download:
+            size = known_size
+            if size is None:
+                try:
+                    r = self.session.head(url, timeout=(10, 15), allow_redirects=True)
+                    cl = r.headers.get("content-length")
+                    if cl:
+                        size = int(cl)
+                except Exception:
+                    pass
+            db.insert_file(conn, project_id, file_name, file_type, "NOT_ATTEMPTED", url, size)
+            kb = f"{size // 1024} KB" if size else "size unknown"
+            print(f"    - {file_name} [NOT_ATTEMPTED] ({kb})")
+            return
+
+        status    = "FAILED_SERVER_UNRESPONSIVE"
+        file_size = None
+
+        # Pre-check known size from metadata before making any request
+        if cap and known_size and known_size > cap:
+            status = "FAILED_TOO_LARGE"
+            db.insert_file(conn, project_id, file_name, file_type, status, url, known_size)
+            print(f"    ✗ {file_name} [FAILED_TOO_LARGE] (metadata: {known_size // 1024} KB)")
+            return
+
         dest_dir.mkdir(parents=True, exist_ok=True)
-        dest   = dest_dir / file_name
-        status = "FAILED_SERVER_UNRESPONSIVE"
+        dest = dest_dir / file_name
         try:
-            resp = self.session.get(url, stream=True, timeout=60)
+            # (connect_timeout, read_timeout) — fail fast on hangs
+            resp = self.session.get(url, stream=True, timeout=(10, 60))
             if resp.status_code in (401, 403):
                 status = "FAILED_LOGIN_REQUIRED"
             else:
                 resp.raise_for_status()
-                size = 0
-                with open(dest, "wb") as f:
-                    for chunk in resp.iter_content(8192):
-                        size += len(chunk)
-                        if cap and size > cap:
-                            dest.unlink(missing_ok=True)
-                            status = "FAILED_TOO_LARGE"
-                            break
-                        f.write(chunk)
-                    else:
-                        status = "SUCCEEDED"
+                # Check Content-Length header before streaming
+                content_length = int(resp.headers.get("content-length", 0))
+                if cap and content_length and content_length > cap:
+                    status    = "FAILED_TOO_LARGE"
+                    file_size = content_length
+                else:
+                    size = 0
+                    with open(dest, "wb") as f:
+                        for chunk in resp.iter_content(8192):
+                            size += len(chunk)
+                            if cap and size > cap:
+                                dest.unlink(missing_ok=True)
+                                status    = "FAILED_TOO_LARGE"
+                                file_size = size
+                                break
+                            f.write(chunk)
+                        else:
+                            status    = "SUCCEEDED"
+                            file_size = size
         except Exception:
             status = "FAILED_SERVER_UNRESPONSIVE"
 
-        db.insert_file(conn, project_id, file_name, file_type, status)
+        db.insert_file(conn, project_id, file_name, file_type, status, url, file_size)
         icon = "✓" if status == "SUCCEEDED" else "✗"
         print(f"    {icon} {file_name} [{status}]")
 
@@ -133,8 +167,8 @@ class OAIHarvester(BaseHarvester):
         print(f"  Done. {len(ids)} projects from {self.repo_url}")
         return ids
 
-    def download_projects(self, project_ids: list[int], max_file_bytes: int | None = None):
-        print(f"\n[OAI Download] {len(project_ids)} projects from {self.repo_url}")
+    def download_projects(self, project_ids: list[int], max_file_bytes: int | None = None, download: bool = True):
+        print(f"\n[OAI Files] {len(project_ids)} projects from {self.repo_url}")
         base = self.repo_url.rstrip("/")
 
         for pid in project_ids:
@@ -158,7 +192,7 @@ class OAIHarvester(BaseHarvester):
                     for path in paths:
                         name   = path.split("/")[-1]
                         dl_url = f"{base}{path}"
-                        self._save_file(conn, pid, dl_url, name, dest_dir, max_file_bytes)
+                        self._save_file(conn, pid, dl_url, name, dest_dir, max_file_bytes, download=download)
 
             except Exception as e:
                 print(f"  ! Project {pid} error: {e}")
@@ -267,8 +301,8 @@ class DataverseHarvester(BaseHarvester):
         print(f"  Done. {len(ids)} projects from {self.repo_url}")
         return ids
 
-    def download_projects(self, project_ids: list[int], max_file_bytes: int | None = None):
-        print(f"\n[Dataverse Download] {len(project_ids)} projects from {self.repo_url}")
+    def download_projects(self, project_ids: list[int], max_file_bytes: int | None = None, download: bool = True):
+        print(f"\n[Dataverse Files] {len(project_ids)} projects from {self.repo_url}")
 
         for pid in project_ids:
             with db.get_conn() as conn:
@@ -295,7 +329,8 @@ class DataverseHarvester(BaseHarvester):
                         file_id = df.get("id")
                         name    = df.get("filename", f"file_{file_id}")
                         dl_url  = f"{self.api_base}/api/access/datafile/{file_id}"
-                        self._save_file(conn, pid, dl_url, name, dest_dir, max_file_bytes)
+                        self._save_file(conn, pid, dl_url, name, dest_dir, max_file_bytes,
+                                        known_size=df.get("filesize"), download=download)
 
             except Exception as e:
                 print(f"  ! Project {pid} error: {e}")

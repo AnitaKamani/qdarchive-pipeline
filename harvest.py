@@ -80,5 +80,4 @@ if __name__ == "__main__":
         cls       = HARVESTER_MAP[repo["type"]]
         harvester = cls(**{k: v for k, v in repo.items() if k != "type"})
         ids       = harvester.run(config.KEYWORDS, config.QDA_EXTENSIONS, limit)
-        if do_download:
-            harvester.download_projects(ids, max_file_bytes=max_file_mb)
+        harvester.download_projects(ids, max_file_bytes=max_file_mb, download=do_download)

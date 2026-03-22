@@ -30,7 +30,9 @@ CREATE TABLE IF NOT EXISTS files (
     project_id  INTEGER NOT NULL REFERENCES projects(id),
     file_name   TEXT    NOT NULL,
     file_type   TEXT    NOT NULL,
-    status      TEXT    NOT NULL CHECK(status IN ('SUCCEEDED','FAILED_SERVER_UNRESPONSIVE','FAILED_LOGIN_REQUIRED','FAILED_TOO_LARGE'))
+    file_url    TEXT,
+    file_size   INTEGER,
+    status      TEXT    NOT NULL CHECK(status IN ('SUCCEEDED','FAILED_SERVER_UNRESPONSIVE','FAILED_LOGIN_REQUIRED','FAILED_TOO_LARGE','NOT_ATTEMPTED'))
 );
 
 CREATE TABLE IF NOT EXISTS keywords (
@@ -72,6 +74,47 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        _migrate_files_table(conn)
+
+
+def _migrate_files_table(conn):
+    """Recreate files table if schema is outdated (new columns or CHECK values)."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(files)")}
+    needs_recreate = "file_url" not in cols or "file_size" not in cols
+
+    if not needs_recreate:
+        # Check if NOT_ATTEMPTED is already accepted
+        try:
+            conn.execute("SAVEPOINT chk")
+            conn.execute("INSERT INTO files (project_id,file_name,file_type,status) "
+                         "VALUES (1,'_chk','_chk','NOT_ATTEMPTED')")
+            conn.execute("DELETE FROM files WHERE file_name='_chk'")
+            conn.execute("RELEASE chk")
+            return  # constraint already updated
+        except Exception:
+            conn.execute("ROLLBACK TO chk")
+            conn.execute("RELEASE chk")
+            needs_recreate = True
+
+    if needs_recreate:
+        conn.executescript("""
+            CREATE TABLE files_new (
+                id          INTEGER PRIMARY KEY,
+                project_id  INTEGER NOT NULL REFERENCES projects(id),
+                file_name   TEXT    NOT NULL,
+                file_type   TEXT    NOT NULL,
+                file_url    TEXT,
+                file_size   INTEGER,
+                status      TEXT    NOT NULL CHECK(status IN (
+                    'SUCCEEDED','FAILED_SERVER_UNRESPONSIVE',
+                    'FAILED_LOGIN_REQUIRED','FAILED_TOO_LARGE','NOT_ATTEMPTED'))
+            );
+            INSERT INTO files_new (id, project_id, file_name, file_type, status)
+                SELECT id, project_id, file_name, file_type, status FROM files;
+            DROP TABLE files;
+            ALTER TABLE files_new RENAME TO files;
+        """)
+        print("DB migrated: files table updated.")
 
 
 def truncate_db():
@@ -108,10 +151,11 @@ def insert_project(conn, data: dict) -> int:
     return cur.lastrowid
 
 
-def insert_file(conn, project_id: int, file_name: str, file_type: str, status: str):
+def insert_file(conn, project_id: int, file_name: str, file_type: str, status: str,
+                file_url: str | None = None, file_size: int | None = None):
     conn.execute(
-        "INSERT INTO files (project_id, file_name, file_type, status) VALUES (?,?,?,?)",
-        (project_id, file_name, file_type, status),
+        "INSERT INTO files (project_id, file_name, file_type, file_url, file_size, status) VALUES (?,?,?,?,?,?)",
+        (project_id, file_name, file_type, file_url, file_size, status),
     )
 
 
