@@ -1,0 +1,104 @@
+\documentclass[usenames,dvipsnames]{article}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{enumitem}
+
+\definecolor{light-gray}{gray}{0.95}
+\definecolor{light-red}{RGB}{240,220,220}
+\definecolor{light-blue}{RGB}{219,233,243}
+\definecolor{light-yellow}{RGB}{254,247,209}
+\definecolor{light-green}{RGB}{224,238,212}
+
+\newcommand{\code}[1]{\colorbox{light-gray}{\texttt{#1}}}
+\newcommand{\command}[1]{\colorbox{light-red}{\texttt{#1}}}
+\newcommand{\option}[1]{\colorbox{light-blue}{\texttt{#1}}}
+\newcommand{\chargingdocs}[1]{\colorbox{light-yellow}{\texttt{#1}}}
+\newcommand{\variable}[1]{\colorbox{light-green}{\texttt{#1}}}
+\newcommand{\note}[1]{\textit{\textbf{Note:} }}
+
+
+\title{International Criminal Law Charging Document Database User Manual \\ Version 7}
+\author{Dr Cale Davis}
+
+\begin{document}
+	\maketitle
+
+\section{Introduction}
+The International Criminal Law Charging Document Database allows you to query all final charging documents issued by the ICTY, ICTR, SCSL, and ICC.
+
+This document is intended to be a quick reference handbook for those using the database with MAXQDA2020.
+
+A REFI-QDPX file is also included in the deposit.
+\subsection{Colour Notation}
+\begin{itemize}
+	\item \chargingdocs{Document Sets}: Contains the final charging documents, categorised by court.
+	\item \variable{Document Variable}: The ICLCDD contains additional information about each final charging document. For daily operational purposes, these variables are `Court' and `Year'. These are used when activating documents.
+	\item \code{Code}: Each final charging document contains codes. These codes are attached to segments of text that describe the defendant, the charge type (war crimes, crimes against humanity, or genocide), and the particularised conduct that constitutes the charge type. Note the following:
+	\begin{enumerate}
+		\item Each charge has \textit{one} \code{[Charge Type]}. The \code{[Charge Type]} code is therefore synonymous with the number of charges on a final charging document.
+		\item Each charge will also have one or more \code{[Charges]} that describe the particularised conduct that constitutes the \code{[Charge Type]}.
+		\item \code{[Charge Type]} and \code{[Charges]} will have one or more \code{[Defendant] - [COURT]}.
+		\item \code{[Charge Type]} is \textit{always} contained within by \code{[Charges]} and \code{[Defendant] - [COURT]}.
+		\begin{quote}
+		For instance: 
+	\end{quote}
+	\end{enumerate}
+	\item \command{MAXQDA Command}: MAXQDA functionality.
+	\item \option{MAXQDA Option}: Options that MAXQDA gives users when using a MAXQDA command.
+\end{itemize} 
+
+\section{Popular Queries}
+\subsection{Get Total Number of Charges for a Defendant \\ \textit{Basic query function}}
+\begin{enumerate}
+	\item Select all \chargingdocs{Documents}.
+	\item Select a defendant or defendants under \code{[Defendant] - [COURT]}.
+	\item Select \command{Code Relations Browser}.
+	\item Check \option{Choose top-level code}.
+	\item Select \code{[Charge Type]} as the top-level code and run the query.
+\end{enumerate}
+
+\subsection{Get Number of Charges for a Defendant, Excluding Alternative Charges \\ \textit{Basic query function}}
+\note ~This should---\textit{should}---be easy enough to do, by simply running a complex coding query to select all subcodes of \code{[Charge Type]} that do not overlap with \code{[Alternative] = True}, and then run the \command{Code Relations Browser} with the results and the appropriate \code{[Defendant] - [COURT]}. But you can't do that: the main \command{Code Relations Browser} function doesn't have a \option{Only for retrieved segments} option; and the one in the Retrieved Segments frame has no options at all. So, unfortunately, we need to take the long way round.
+\begin{enumerate}
+	\item Select all \chargingdocs{Documents}.
+	\item Select \command{Complex Coding Query}.
+	\item Select \option{If outside}.
+	\item In the \option{A: Codes} frame, drag and drop one \textit{subcode} from \code{[Charge Type]}.
+	\item In the \option{B: Code} frame, drag and drop \code{[Alternative] = True}.
+	\item Run the query.
+	\item Now, in the Retrieved Results frame, \command{Autocode} the results with a descriptive name (such as `CaH - Not Alt'). This will take a bit of time.
+	\item Deselect the \code{[Charge Type]} code and select another. The complex coding query will remain active.
+	\item Repeat steps 7 and 8 for the remaining codes.
+\end{enumerate}
+
+\subsection{Get Total Number of Charges \\ \textit{Sum number of charges for all defendants}}
+\note ~MAXQDA will only take into account 200 codes when running the Code Relations Browser, so it is necessary to repeat the below several times for each court.
+
+\begin{enumerate}
+	\item Select all \chargingdocs{Documents}.
+	\item Select \code{[Defendant] - [COURT]}.
+	\item Select \command{Code Relations Browser}.
+	\item Check \option{Choose top-level code}.
+	\item Select \code{[Charge Type]} as the top-level code and run the query.
+	\item Repeat for each court and sum the results (the sum for all courts should be 2,774).
+\end{enumerate}
+
+\subsection{Track Charges Over Time \\ \textit{Display charges per year}}
+\note ~Until MAXQDA develops the capacity to run \command{Crosstab} on retrieved segments, obtaining this data requires reiterating queries for each year and court for which you want data. This is a pain, but for courts such as the ICC and SCSL (which have far fewer years of documents to consider), the process is not as slow as you might initially think.
+
+Do not cut corners here by simply running \command{Crosstab} on the defendants and charges you want to see data for: it is fundamentally important that in order to obtain accurate data, you count the charges \textit{per individual} and not simply the number of \textit{charges} codes each year. 
+
+This is why this process is so long: it allows you to obtain the number of \code{[Charge Type]} or \code{[Charges]} codes per \code{[Defendant]} per court per year.
+\begin{enumerate}
+	\item Select \code{[Defendant] - [COURT]}.
+	\item Select \command{Activate by Document Variables} in order to activate the necessary \chargingdocs{Documents}.
+	\item Select as \option{Conditions} the \variable{Court} and \variable{Year}, and activate them.
+	\item Select \command{Code Relations Browser}.
+	\item Check \option{Choose top-level code}.
+	\item Select \code{[Charge Type]} or \code{[Charges]} as the top-level code and run the query.
+\end{enumerate}
+\note ~You may invert steps 1 and 6. For instance, if you want data on \textit{specific} \code{[Charges]}, you will not be able to select these sub-codes as the top-level code. For this reason, it is only possible to select \code{[Defendant]} as the top-level code. 
+\begin{enumerate}[resume]
+	\item Repeat steps 2-6 for each \variable{Court} and \variable{Year} for which you want data.
+\end{enumerate}
+	
+\end{document}
