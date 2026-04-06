@@ -264,10 +264,12 @@ class OAIHarvester(BaseHarvester):
 # ── Dataverse ─────────────────────────────────────────────────────────────────
 
 class DataverseHarvester(BaseHarvester):
-    def __init__(self, api_url: str, **kwargs):
+    def __init__(self, api_url: str, api_token: str | None = None, **kwargs):
         super().__init__(**kwargs)
         self.api_url  = api_url
-        self.api_base = api_url.split("/api/")[0]   # e.g. https://ssh.datastations.nl
+        self.api_base = api_url.split("/api/")[0]
+        if api_token:
+            self.session.headers.update({"X-Dataverse-key": api_token})
 
     def run(self, keywords, extensions, limit) -> list[int]:
         seen      = set()
@@ -333,12 +335,22 @@ class DataverseHarvester(BaseHarvester):
 
                 dest_dir = self._dest_dir(row["download_project_folder"])
                 print(f"  Project {pid} — {len(files)} file(s)")
+                has_token = bool(self.session.headers.get("X-Dataverse-key"))
                 with db.get_conn() as conn:
                     for entry in files:
-                        df      = entry.get("dataFile", {})
-                        file_id = df.get("id")
-                        name    = df.get("filename", f"file_{file_id}")
-                        dl_url  = f"{self.api_base}/api/access/datafile/{file_id}"
+                        df         = entry.get("dataFile", {})
+                        file_id    = df.get("id")
+                        name       = df.get("filename", f"file_{file_id}")
+                        dl_url     = f"{self.api_base}/api/access/datafile/{file_id}"
+                        restricted = entry.get("restricted", False) or df.get("restricted", False)
+                        # skip HTTP entirely if restricted and no token
+                        if restricted and not has_token:
+                            file_type = Path(name).suffix.lstrip(".").lower() or "unknown"
+                            db.insert_file(conn, pid, name, file_type, "FAILED_LOGIN_REQUIRED",
+                                           dl_url, df.get("filesize"))
+                            kb = f"{df['filesize'] // 1024} KB" if df.get("filesize") else "size unknown"
+                            print(f"    ✗ {name} [FAILED_LOGIN_REQUIRED] restricted, no token ({kb})")
+                            continue
                         self._save_file(conn, pid, dl_url, name, dest_dir, max_file_bytes,
                                         known_size=df.get("filesize"), download=download)
 

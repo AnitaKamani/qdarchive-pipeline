@@ -1,3 +1,7 @@
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
 # ── match terms ───────────────────────────────────────────────────────────────
 
 KEYWORDS = [
@@ -40,6 +44,7 @@ REPOS = [
         "repo_url":    "https://dans.knaw.nl",
         "repo_folder": "dans",
         "api_url":     "https://ssh.datastations.nl/api/search",
+        "api_token":   os.getenv("DANS_API_TOKEN"),
     },
 ]
 
