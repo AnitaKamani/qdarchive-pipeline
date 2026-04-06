@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS files (
     file_type   TEXT    NOT NULL,
     file_url    TEXT,
     file_size   INTEGER,
+    zip_path    TEXT,
     status      TEXT    NOT NULL CHECK(status IN ('SUCCEEDED','FAILED_SERVER_UNRESPONSIVE','FAILED_LOGIN_REQUIRED','FAILED_TOO_LARGE','NOT_ATTEMPTED'))
 );
 
@@ -80,7 +81,7 @@ def init_db():
 def _migrate_files_table(conn):
     """Recreate files table if schema is outdated (new columns or CHECK values)."""
     cols = {row[1] for row in conn.execute("PRAGMA table_info(files)")}
-    needs_recreate = "file_url" not in cols or "file_size" not in cols
+    needs_recreate = "file_url" not in cols or "file_size" not in cols or "zip_path" not in cols
 
     if not needs_recreate:
         # Check if NOT_ATTEMPTED is already accepted
@@ -105,12 +106,13 @@ def _migrate_files_table(conn):
                 file_type   TEXT    NOT NULL,
                 file_url    TEXT,
                 file_size   INTEGER,
+                zip_path    TEXT,
                 status      TEXT    NOT NULL CHECK(status IN (
                     'SUCCEEDED','FAILED_SERVER_UNRESPONSIVE',
                     'FAILED_LOGIN_REQUIRED','FAILED_TOO_LARGE','NOT_ATTEMPTED'))
             );
-            INSERT INTO files_new (id, project_id, file_name, file_type, status)
-                SELECT id, project_id, file_name, file_type, status FROM files;
+            INSERT INTO files_new (id, project_id, file_name, file_type, file_url, file_size, status)
+                SELECT id, project_id, file_name, file_type, file_url, file_size, status FROM files;
             DROP TABLE files;
             ALTER TABLE files_new RENAME TO files;
         """)
@@ -134,6 +136,15 @@ def truncate_db():
 
 # ── insert helpers ────────────────────────────────────────────────────────────
 
+def project_exists(conn, repository_id: int, project_url: str) -> int | None:
+    """Return existing project id if already harvested, else None."""
+    row = conn.execute(
+        "SELECT id FROM projects WHERE repository_id=? AND project_url=?",
+        (repository_id, project_url),
+    ).fetchone()
+    return row["id"] if row else None
+
+
 def insert_project(conn, data: dict) -> int:
     cur = conn.execute("""
         INSERT INTO projects (
@@ -152,10 +163,11 @@ def insert_project(conn, data: dict) -> int:
 
 
 def insert_file(conn, project_id: int, file_name: str, file_type: str, status: str,
-                file_url: str | None = None, file_size: int | None = None):
+                file_url: str | None = None, file_size: int | None = None,
+                zip_path: str | None = None):
     conn.execute(
-        "INSERT INTO files (project_id, file_name, file_type, file_url, file_size, status) VALUES (?,?,?,?,?,?)",
-        (project_id, file_name, file_type, file_url, file_size, status),
+        "INSERT INTO files (project_id, file_name, file_type, file_url, file_size, zip_path, status) VALUES (?,?,?,?,?,?,?)",
+        (project_id, file_name, file_type, file_url, file_size, zip_path, status),
     )
 
 

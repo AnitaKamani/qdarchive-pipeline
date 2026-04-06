@@ -1,13 +1,20 @@
+import io
 import re
+import tarfile
+import tempfile
+import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-CET = ZoneInfo("Europe/Berlin")
-
+import py7zr
+import rarfile
 import requests
 import db
+import config
+
+CET = ZoneInfo("Europe/Berlin")
 
 DOWNLOAD_ROOT  = "downloads"
 MAX_FILE_BYTES = 500 * 1024 * 1024   # 500 MB hard cap
@@ -47,9 +54,17 @@ class BaseHarvester:
         return Path(DOWNLOAD_ROOT) / self.repo_folder / project_folder
 
     def _save_file(self, conn, project_id: int, url: str, file_name: str, dest_dir: Path,
-                   max_bytes: int | None = None, known_size: int | None = None, download: bool = True):
+                   max_bytes: int | None = None, known_size: int | None = None,
+                   download: bool = True, query_string: str = ""):
         cap       = max_bytes if max_bytes is not None else MAX_FILE_BYTES
-        file_type = Path(file_name).suffix.lstrip(".").lower() or "unknown"
+        suffix    = Path(file_name).suffix.lower()
+        file_type = suffix.lstrip(".") or "unknown"
+
+        # Route archives to dedicated handler
+        if suffix in config.COMPRESS_EXTENSIONS:
+            self._handle_archive(conn, project_id, url, file_name, dest_dir,
+                                 cap, known_size, download, query_string)
+            return
 
         if not download:
             size = known_size
@@ -69,7 +84,6 @@ class BaseHarvester:
         status    = "FAILED_SERVER_UNRESPONSIVE"
         file_size = None
 
-        # Pre-check known size from metadata before making any request
         if cap and known_size and known_size > cap:
             status = "FAILED_TOO_LARGE"
             db.insert_file(conn, project_id, file_name, file_type, status, url, known_size)
@@ -79,13 +93,11 @@ class BaseHarvester:
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / file_name
         try:
-            # (connect_timeout, read_timeout) — fail fast on hangs
             resp = self.session.get(url, stream=True, timeout=(10, 60))
             if resp.status_code in (401, 403):
                 status = "FAILED_LOGIN_REQUIRED"
                 file_size = known_size
                 if file_size is None:
-                    print('shit\n\n\n\n\n')
                     try:
                         r = self.session.head(url, timeout=(10, 15), allow_redirects=True)
                         cl = r.headers.get("content-length")
@@ -95,7 +107,6 @@ class BaseHarvester:
                         pass
             else:
                 resp.raise_for_status()
-                # Check Content-Length header before streaming
                 content_length = int(resp.headers.get("content-length", 0))
                 if cap and content_length and content_length > cap:
                     status    = "FAILED_TOO_LARGE"
@@ -120,6 +131,196 @@ class BaseHarvester:
         db.insert_file(conn, project_id, file_name, file_type, status, url, file_size)
         icon = "✓" if status == "SUCCEEDED" else "✗"
         print(f"    {icon} {file_name} [{status}]")
+
+    def _handle_archive(self, conn, project_id: int, url: str, file_name: str,
+                        dest_dir: Path, cap: int, known_size: int | None,
+                        download: bool, query_string: str):
+        """Handle archive files: peek inside, decide whether to download, record inner files."""
+        suffix     = Path(file_name).suffix.lower()
+        multiplier = config.ZIP_OVERSIZED_MULTIPLIER
+        extensions = set(config.QDA_EXTENSIONS)
+        by_keyword = query_string.lower() not in {e.lstrip(".") for e in config.QDA_EXTENSIONS} \
+                     and query_string not in {e.lstrip(".") for e in config.QDA_EXTENSIONS}
+
+        # Get archive size via HEAD if not known
+        arc_size = known_size
+        if arc_size is None:
+            try:
+                r = self.session.head(url, timeout=(10, 15), allow_redirects=True)
+                cl = r.headers.get("content-length")
+                if cl:
+                    arc_size = int(cl)
+            except Exception:
+                pass
+
+        if not download:
+            # Just peek and record inner files as NOT_ATTEMPTED
+            inner = self._peek_archive(url, suffix, arc_size, cap, multiplier)
+            if inner is None:
+                # couldn't peek — record the archive itself
+                db.insert_file(conn, project_id, file_name, suffix.lstrip(".") or "archive",
+                               "NOT_ATTEMPTED", url, arc_size)
+                print(f"    - {file_name} [NOT_ATTEMPTED] (archive, could not peek)")
+                return
+            relevant = [f for f in inner if Path(f['name']).suffix.lower() in extensions]
+            to_record = relevant if not by_keyword else inner
+            if not to_record and not by_keyword:
+                print(f"    - {file_name} skipped (archive, no relevant files inside)")
+                return
+            for f in to_record:
+                ft = Path(f['name']).suffix.lstrip(".").lower() or "unknown"
+                db.insert_file(conn, project_id, f['name'], ft, "NOT_ATTEMPTED",
+                               url, f['size'], zip_path=file_name)
+                print(f"    - {f['name']} [NOT_ATTEMPTED] in {file_name}")
+            return
+
+        # --- downloading ---
+        # Size gate: zip_size <= file_count * cap AND no inner file > cap * multiplier
+        inner = self._peek_archive(url, suffix, arc_size, cap, multiplier)
+
+        if inner is not None:
+            relevant = [f for f in inner if Path(f['name']).suffix.lower() in extensions]
+            if not by_keyword and not relevant:
+                print(f"    - {file_name} skipped (no relevant files inside)")
+                return
+            file_count = len(inner)
+            # aggregate size check
+            if cap and arc_size and arc_size > file_count * cap:
+                ft = suffix.lstrip(".") or "archive"
+                db.insert_file(conn, project_id, file_name, ft, "FAILED_TOO_LARGE", url, arc_size)
+                print(f"    ✗ {file_name} [FAILED_TOO_LARGE] archive too large")
+                return
+            # individual file check
+            oversized = [f for f in inner if cap and f['size'] and f['size'] > cap * multiplier]
+            if oversized:
+                ft = suffix.lstrip(".") or "archive"
+                db.insert_file(conn, project_id, file_name, ft, "FAILED_TOO_LARGE", url, arc_size)
+                print(f"    ✗ {file_name} [FAILED_TOO_LARGE] contains oversized file(s)")
+                return
+            to_record = relevant if not by_keyword else inner
+        else:
+            # Can't peek — fall back to raw size check with multiplier
+            if cap and arc_size and arc_size > cap * multiplier:
+                ft = suffix.lstrip(".") or "archive"
+                db.insert_file(conn, project_id, file_name, ft, "FAILED_TOO_LARGE", url, arc_size)
+                print(f"    ✗ {file_name} [FAILED_TOO_LARGE]")
+                return
+            to_record = None  # record all after download
+
+        # Download the archive
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        arc_dest = dest_dir / file_name
+        status = "FAILED_SERVER_UNRESPONSIVE"
+        try:
+            resp = self.session.get(url, stream=True, timeout=(10, 60))
+            if resp.status_code in (401, 403):
+                status = "FAILED_LOGIN_REQUIRED"
+                ft = suffix.lstrip(".") or "archive"
+                db.insert_file(conn, project_id, file_name, ft, status, url, arc_size)
+                print(f"    ✗ {file_name} [{status}]")
+                return
+            resp.raise_for_status()
+            size = 0
+            with open(arc_dest, "wb") as f:
+                for chunk in resp.iter_content(8192):
+                    size += len(chunk)
+                    f.write(chunk)
+            status = "SUCCEEDED"
+        except Exception:
+            ft = suffix.lstrip(".") or "archive"
+            db.insert_file(conn, project_id, file_name, ft, status, url, arc_size)
+            print(f"    ✗ {file_name} [{status}]")
+            return
+
+        # If we couldn't peek before, read inner listing now from downloaded file
+        if to_record is None:
+            inner = self._list_archive(arc_dest, suffix)
+            if inner is not None:
+                relevant = [f for f in inner if Path(f['name']).suffix.lower() in extensions]
+                to_record = relevant if not by_keyword else inner
+                if not by_keyword and not to_record:
+                    arc_dest.unlink(missing_ok=True)
+                    print(f"    - {file_name} deleted (no relevant files inside)")
+                    return
+            else:
+                to_record = [{"name": file_name, "size": size}]
+
+        zip_path_str = str(arc_dest)
+        for f in to_record:
+            ft = Path(f['name']).suffix.lstrip(".").lower() or "unknown"
+            db.insert_file(conn, project_id, f['name'], ft, "SUCCEEDED",
+                           url, f['size'], zip_path=zip_path_str)
+        print(f"    ✓ {file_name} [SUCCEEDED] — {len(to_record)} inner file(s) recorded")
+
+    def _peek_archive(self, url: str, suffix: str, arc_size: int | None,
+                      cap: int, multiplier: int) -> list[dict] | None:
+        """Try to read archive listing without full download. Returns list of {name, size} or None."""
+        try:
+            if suffix == ".zip":
+                return self._peek_zip(url, arc_size)
+            # For other types, only peek if compressed size <= cap * multiplier
+            if cap and arc_size and arc_size > cap * multiplier:
+                return None
+            # Download to temp and list
+            resp = self.session.get(url, timeout=(10, 120))
+            resp.raise_for_status()
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(resp.content)
+                tmp_path = Path(tmp.name)
+            try:
+                return self._list_archive(tmp_path, suffix)
+            finally:
+                tmp_path.unlink(missing_ok=True)
+        except Exception:
+            return None
+
+    def _peek_zip(self, url: str, arc_size: int | None) -> list[dict] | None:
+        """Read ZIP central directory via HTTP Range request — no full download."""
+        try:
+            # Fetch last 65KB which contains the ZIP end-of-central-directory
+            fetch_bytes = min(65536, arc_size) if arc_size else 65536
+            r = self.session.get(url, headers={"Range": f"bytes=-{fetch_bytes}"}, timeout=(10, 30))
+            if r.status_code not in (206, 200):
+                return None
+            data = r.content
+            # Find end-of-central-directory signature
+            eocd = data.rfind(b'PK\x05\x06')
+            if eocd == -1:
+                return None
+            # Need the central directory — may require a second request for larger ZIPs
+            cd_size   = int.from_bytes(data[eocd+12:eocd+16], 'little')
+            cd_offset = int.from_bytes(data[eocd+16:eocd+20], 'little')
+            r2 = self.session.get(url, headers={"Range": f"bytes={cd_offset}-{cd_offset+cd_size-1}"},
+                                  timeout=(10, 30))
+            if r2.status_code not in (206, 200):
+                return None
+            buf = io.BytesIO(r2.content + data[eocd:])
+            with zipfile.ZipFile(buf) as zf:
+                return [{"name": i.filename, "size": i.file_size}
+                        for i in zf.infolist() if not i.is_dir()]
+        except Exception:
+            return None
+
+    def _list_archive(self, path: Path, suffix: str) -> list[dict] | None:
+        """List contents of a local archive file."""
+        try:
+            if suffix == ".zip":
+                with zipfile.ZipFile(path) as zf:
+                    return [{"name": i.filename, "size": i.file_size}
+                            for i in zf.infolist() if not i.is_dir()]
+            if suffix in (".tar", ".gz", ".tgz", ".bz2", ".tar.gz"):
+                with tarfile.open(path) as tf:
+                    return [{"name": m.name, "size": m.size} for m in tf.getmembers() if m.isfile()]
+            if suffix == ".rar":
+                with rarfile.RarFile(path) as rf:
+                    return [{"name": i.filename, "size": i.file_size}
+                            for i in rf.infolist() if not i.is_dir()]
+            if suffix == ".7z":
+                with py7zr.SevenZipFile(path, mode='r') as sz:
+                    return [{"name": f.filename, "size": f.uncompressed or 0}
+                            for f in sz.list() if not f.is_directory]
+        except Exception:
+            return None
 
 
 # ── OAI-PMH ───────────────────────────────────────────────────────────────────
@@ -163,6 +364,8 @@ class OAIHarvester(BaseHarvester):
                     kw   = self._match(text, keywords, extensions)
                     if kw:
                         pid = self._process(conn, record, kw)
+                        if pid is None:
+                            continue
                         ids.append(pid)
                         title = (self._fields(record, "title") or ["?"])[0][:70]
                         print(f"  + [{kw}] {title}")
@@ -199,10 +402,13 @@ class OAIHarvester(BaseHarvester):
                 dest_dir = self._dest_dir(row["download_project_folder"])
                 print(f"  Project {pid} — {len(paths)} file(s)")
                 with db.get_conn() as conn:
+                    qs = conn.execute("SELECT query_string FROM projects WHERE id=?", (pid,)).fetchone()
+                    query_string = qs["query_string"] if qs else ""
                     for path in paths:
                         name   = path.split("/")[-1]
                         dl_url = f"{base}{path}"
-                        self._save_file(conn, pid, dl_url, name, dest_dir, max_file_bytes, download=download)
+                        self._save_file(conn, pid, dl_url, name, dest_dir, max_file_bytes,
+                                        download=download, query_string=query_string)
 
             except Exception as e:
                 print(f"  ! Project {pid} error: {e}")
@@ -235,8 +441,12 @@ class OAIHarvester(BaseHarvester):
                 return f"https://doi.org/{raw}"
         return None
 
-    def _process(self, conn, record, query_string: str) -> int:
+    def _process(self, conn, record, query_string: str) -> int | None:
         url = self._project_url(record)
+        existing = db.project_exists(conn, self.repo_id, url)
+        if existing:
+            print(f"  ~ skipped (already in DB): {url}")
+            return None
         project_id = db.insert_project(conn, {
             "query_string":               query_string,
             "repository_id":              self.repo_id,
@@ -303,6 +513,8 @@ class DataverseHarvester(BaseHarvester):
                             continue
                         seen.add(url)
                         pid = self._process(conn, item, term)
+                        if pid is None:
+                            continue
                         ids.append(pid)
                         print(f"  + [{term}] {item.get('name', '?')[:70]}")
 
@@ -337,13 +549,14 @@ class DataverseHarvester(BaseHarvester):
                 print(f"  Project {pid} — {len(files)} file(s)")
                 has_token = bool(self.session.headers.get("X-Dataverse-key"))
                 with db.get_conn() as conn:
+                    qs = conn.execute("SELECT query_string FROM projects WHERE id=?", (pid,)).fetchone()
+                    query_string = qs["query_string"] if qs else ""
                     for entry in files:
                         df         = entry.get("dataFile", {})
                         file_id    = df.get("id")
                         name       = df.get("filename", f"file_{file_id}")
                         dl_url     = f"{self.api_base}/api/access/datafile/{file_id}"
                         restricted = entry.get("restricted", False) or df.get("restricted", False)
-                        # skip HTTP entirely if restricted and no token
                         if restricted and not has_token:
                             file_type = Path(name).suffix.lstrip(".").lower() or "unknown"
                             db.insert_file(conn, pid, name, file_type, "FAILED_LOGIN_REQUIRED",
@@ -352,13 +565,18 @@ class DataverseHarvester(BaseHarvester):
                             print(f"    ✗ {name} [FAILED_LOGIN_REQUIRED] restricted, no token ({kb})")
                             continue
                         self._save_file(conn, pid, dl_url, name, dest_dir, max_file_bytes,
-                                        known_size=df.get("filesize"), download=download)
+                                        known_size=df.get("filesize"), download=download,
+                                        query_string=query_string)
 
             except Exception as e:
                 print(f"  ! Project {pid} error: {e}")
 
-    def _process(self, conn, item: dict, query_string: str) -> int:
+    def _process(self, conn, item: dict, query_string: str) -> int | None:
         url = item.get("url", "")
+        existing = db.project_exists(conn, self.repo_id, url)
+        if existing:
+            print(f"  ~ skipped (already in DB): {url}")
+            return None
         doi = item.get("global_id", "")
         if doi and not doi.startswith("http"):
             doi = f"https://doi.org/{doi.removeprefix('doi:').strip()}"

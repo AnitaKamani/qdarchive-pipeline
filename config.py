@@ -48,6 +48,14 @@ REPOS = [
     },
 ]
 
+# ── archive handling ──────────────────────────────────────────────────────────
+
+# Extensions treated as archives (will be peeked/downloaded for inner files)
+COMPRESS_EXTENSIONS = [".zip", ".tar", ".gz", ".tgz", ".tar.gz", ".bz2", ".rar", ".7z"]
+
+# An individual file inside an archive may be at most (size_limit * this) bytes
+ZIP_OVERSIZED_MULTIPLIER = 10
+
 # ── limits ────────────────────────────────────────────────────────────────────
 
 PAGE_LIMIT = 20   # pages per repo; set to None for a full harvest
