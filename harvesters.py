@@ -364,17 +364,11 @@ class OAIHarvester(BaseHarvester):
         saved_token = state["resumption_token"]
         from_date   = state["last_harvested_at"]
 
-        if saved_token:
-            print(f"  Resuming from checkpoint token (page ~{page})")
-            params = {"verb": "ListRecords", "resumptionToken": saved_token}
-        elif from_date:
-            # OAI-PMH uses YYYY-MM-DD; strip the time portion
-            from_short = from_date[:10]
-            print(f"  Incremental harvest from {from_short}")
-            params = {"verb": "ListRecords", "metadataPrefix": "oai_dc", "from": from_short}
-        else:
-            print("  Full harvest (first run)")
-            params = {"verb": "ListRecords", "metadataPrefix": "oai_dc"}
+        # Save run_start now — even if interrupted, next run can use it as `from`
+        with db.get_conn() as conn:
+            db.save_harvest_state(conn, self.repo_id, last_harvested_at=run_start)
+
+        params = self._build_params(saved_token, from_date)
 
         while True:
             if limit and len(ids) >= limit:
@@ -385,6 +379,20 @@ class OAIHarvester(BaseHarvester):
             resp = self._get(self.oai_url, params=params, timeout=30)
             resp.raise_for_status()
             root = ET.fromstring(resp.text)
+
+            # Check for OAI-PMH level errors (e.g. badResumptionToken)
+            error_el = root.find(".//oai:error", OAI_NS)
+            if error_el is not None:
+                code = error_el.get("code", "")
+                print(f"  OAI error: {code} — {error_el.text}")
+                if code == "badResumptionToken":
+                    print("  Token expired — falling back to incremental/full harvest")
+                    with db.get_conn() as conn:
+                        db.save_harvest_state(conn, self.repo_id, resumption_token=None)
+                    params = self._build_params(None, from_date)
+                    page   = 0
+                    continue
+                break
 
             for record in root.findall(".//oai:record", OAI_NS):
                 if limit and len(ids) >= limit:
@@ -409,15 +417,13 @@ class OAIHarvester(BaseHarvester):
 
             if token_el is not None and token_el.text:
                 token = token_el.text
-                # Checkpoint after every page so interruptions can resume
                 with db.get_conn() as conn:
                     db.save_harvest_state(conn, self.repo_id, resumption_token=token)
                 params = {"verb": "ListRecords", "resumptionToken": token}
             else:
-                # Harvest complete — save timestamp, clear token
+                # Harvest complete — clear token (last_harvested_at already saved above)
                 with db.get_conn() as conn:
-                    db.save_harvest_state(conn, self.repo_id,
-                                          last_harvested_at=run_start, resumption_token=None)
+                    db.save_harvest_state(conn, self.repo_id, resumption_token=None)
                 break
 
         print(f"  Done. {len(ids)} projects from {self.repo_url}")
@@ -453,6 +459,17 @@ class OAIHarvester(BaseHarvester):
         print(f"\n[OAI Files] {len(project_ids)} projects from {self.repo_url}")
         for pid in project_ids:
             self._process_files(pid, max_file_bytes, download)
+
+    def _build_params(self, token: str | None, from_date: str | None) -> dict:
+        if token:
+            print(f"  Resuming from checkpoint token")
+            return {"verb": "ListRecords", "resumptionToken": token}
+        if from_date:
+            from_short = from_date[:10]
+            print(f"  Incremental harvest from {from_short}")
+            return {"verb": "ListRecords", "metadataPrefix": "oai_dc", "from": from_short}
+        print("  Full harvest (first run)")
+        return {"verb": "ListRecords", "metadataPrefix": "oai_dc"}
 
     # ── OAI helpers ───────────────────────────────────────────────────────────
 
