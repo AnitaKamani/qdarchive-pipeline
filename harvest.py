@@ -1,7 +1,10 @@
 import sys
+import time
+from collections import deque
+
 import db
 import config
-from harvesters import OAIHarvester, DataverseHarvester
+from harvesters import OAIHarvester, DataverseHarvester, RateLimitError
 
 HARVESTER_MAP = {
     "oai":       OAIHarvester,
@@ -59,7 +62,7 @@ if __name__ == "__main__":
     # ── interactive prompts ───────────────────────────────────────────────────
     do_truncate  = ask_yn("1. Truncate database first?", default=False)
     limit        = ask_limit("2. Max results per repo?")
-    do_download  = ask_yn("3. Download files?", default=False)
+    do_download  = ask_yn("3. Download files?", default=True)
     max_file_mb  = None
     if do_download:
         raw_mb = input("   Max file size in MB? [number / 0 or Enter = no limit]: ").strip()
@@ -76,8 +79,47 @@ if __name__ == "__main__":
     if do_truncate:
         db.truncate_db()
 
-    for repo in repos:
-        cls       = HARVESTER_MAP[repo["type"]]
-        harvester = cls(**{k: v for k, v in repo.items() if k != "type"})
-        ids       = harvester.run(config.KEYWORDS, config.QDA_EXTENSIONS, limit)
-        harvester.download_projects(ids, max_file_bytes=max_file_mb, download=do_download)
+    queue         = deque(repos)
+    failures      = {}   # repo_id -> retry count
+    backoff_until = {}   # repo_id -> timestamp when it may be retried
+
+    while queue:
+        repo = queue.popleft()
+        rid  = repo["repo_id"]
+
+        # Check cooldown
+        wait_until = backoff_until.get(rid, 0)
+        if time.time() < wait_until:
+            queue.append(repo)
+            # If every remaining repo is in cooldown, sleep until the soonest one is ready
+            all_cooling = all(time.time() < backoff_until.get(r["repo_id"], 0) for r in queue)
+            if all_cooling:
+                soonest = min(backoff_until.get(r["repo_id"], 0) for r in queue)
+                wait    = max(0, soonest - time.time())
+                print(f"\nAll repos in cooldown — waiting {wait:.0f}s...")
+                time.sleep(wait)
+            continue
+
+        try:
+            cls       = HARVESTER_MAP[repo["type"]]
+            harvester = cls(**{k: v for k, v in repo.items() if k != "type"})
+            harvester.run(config.KEYWORDS, config.QDA_EXTENSIONS, limit,
+                          max_file_bytes=max_file_mb, download=do_download)
+            # success — clear failure state
+            failures.pop(rid, None)
+            backoff_until.pop(rid, None)
+
+        except RateLimitError as e:
+            count = failures.get(rid, 0) + 1
+            failures[rid] = count
+            if count >= config.MAX_REPO_RETRIES:
+                print(f"\n  Repo {rid} failed {count} times — giving up.")
+            else:
+                backoff = config.REPO_RETRY_BACKOFF * (2 ** (count - 1))
+                backoff_until[rid] = time.time() + backoff
+                print(f"\n  Repo {rid} rate-limited (attempt {count}/{config.MAX_REPO_RETRIES})"
+                      f" — retrying in {backoff}s. Moving to next repo.")
+                queue.append(repo)
+
+        except Exception as e:
+            print(f"\n  Repo {rid} error: {e}")

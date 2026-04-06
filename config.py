@@ -56,6 +56,17 @@ COMPRESS_EXTENSIONS = [".zip", ".tar", ".gz", ".tgz", ".tar.gz", ".bz2", ".rar",
 # An individual file inside an archive may be at most (size_limit * this) bytes
 ZIP_OVERSIZED_MULTIPLIER = 10
 
+# ── request behaviour ─────────────────────────────────────────────────────────
+
+# Random sleep between requests to avoid hammering servers (seconds)
+REQUEST_JITTER = (0.5, 2.0)
+
+# How many times to retry a repo that keeps failing before giving up
+MAX_REPO_RETRIES = 3
+
+# Base cooldown in seconds after a repo fails; doubles each retry (exponential backoff)
+REPO_RETRY_BACKOFF = 60
+
 # ── limits ────────────────────────────────────────────────────────────────────
 
 PAGE_LIMIT = 20   # pages per repo; set to None for a full harvest

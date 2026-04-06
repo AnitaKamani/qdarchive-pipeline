@@ -36,6 +36,12 @@ CREATE TABLE IF NOT EXISTS files (
     status      TEXT    NOT NULL CHECK(status IN ('SUCCEEDED','FAILED_SERVER_UNRESPONSIVE','FAILED_LOGIN_REQUIRED','FAILED_TOO_LARGE','NOT_ATTEMPTED'))
 );
 
+CREATE TABLE IF NOT EXISTS harvest_state (
+    repo_id           INTEGER PRIMARY KEY,
+    last_harvested_at TEXT,
+    resumption_token  TEXT
+);
+
 CREATE TABLE IF NOT EXISTS keywords (
     id          INTEGER PRIMARY KEY,
     project_id  INTEGER NOT NULL REFERENCES projects(id),
@@ -127,6 +133,7 @@ def truncate_db():
             DELETE FROM keywords;
             DELETE FROM files;
             DELETE FROM projects;
+            DELETE FROM harvest_state;
         """)
     downloads = Path("downloads")
     if downloads.exists():
@@ -135,6 +142,24 @@ def truncate_db():
 
 
 # ── insert helpers ────────────────────────────────────────────────────────────
+
+def get_harvest_state(conn, repo_id: int) -> dict:
+    row = conn.execute(
+        "SELECT last_harvested_at, resumption_token FROM harvest_state WHERE repo_id=?", (repo_id,)
+    ).fetchone()
+    return dict(row) if row else {"last_harvested_at": None, "resumption_token": None}
+
+
+def save_harvest_state(conn, repo_id: int, last_harvested_at: str | None = None,
+                       resumption_token: str | None = None):
+    conn.execute("""
+        INSERT INTO harvest_state (repo_id, last_harvested_at, resumption_token)
+        VALUES (?, ?, ?)
+        ON CONFLICT(repo_id) DO UPDATE SET
+            last_harvested_at = COALESCE(excluded.last_harvested_at, last_harvested_at),
+            resumption_token  = excluded.resumption_token
+    """, (repo_id, last_harvested_at, resumption_token))
+
 
 def project_exists(conn, repository_id: int, project_url: str) -> int | None:
     """Return existing project id if already harvested, else None."""

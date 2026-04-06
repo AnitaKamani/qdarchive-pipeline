@@ -1,7 +1,9 @@
 import io
+import random
 import re
 import tarfile
 import tempfile
+import time
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -13,6 +15,10 @@ import rarfile
 import requests
 import db
 import config
+
+
+class RateLimitError(Exception):
+    """Raised when a repo signals rate limiting (429) or repeated connection failures."""
 
 CET = ZoneInfo("Europe/Berlin")
 
@@ -35,6 +41,14 @@ class BaseHarvester:
         raise NotImplementedError
 
     # ── shared helpers ────────────────────────────────────────────────────────
+
+    def _get(self, url: str, **kwargs) -> requests.Response:
+        """session.get() with jitter and 429 → RateLimitError."""
+        time.sleep(random.uniform(*config.REQUEST_JITTER))
+        resp = self.session.get(url, **kwargs)
+        if resp.status_code == 429:
+            raise RateLimitError(f"429 Too Many Requests: {url}")
+        return resp
 
     def _match(self, text: str, keywords, extensions) -> str | None:
         text = text.lower()
@@ -337,11 +351,30 @@ class OAIHarvester(BaseHarvester):
         super().__init__(**kwargs)
         self.oai_url = oai_url
 
-    def run(self, keywords, extensions, limit) -> list[int]:
-        params = {"verb": "ListRecords", "metadataPrefix": "oai_dc"}
-        page = 0
-        ids  = []
+    def run(self, keywords, extensions, limit,
+            max_file_bytes: int | None = None, download: bool = False) -> list[int]:
+        page     = 0
+        ids      = []
+        run_start = self._now()
         print(f"\n[OAI] {self.repo_url}")
+
+        # Load checkpoint
+        with db.get_conn() as conn:
+            state = db.get_harvest_state(conn, self.repo_id)
+        saved_token = state["resumption_token"]
+        from_date   = state["last_harvested_at"]
+
+        if saved_token:
+            print(f"  Resuming from checkpoint token (page ~{page})")
+            params = {"verb": "ListRecords", "resumptionToken": saved_token}
+        elif from_date:
+            # OAI-PMH uses YYYY-MM-DD; strip the time portion
+            from_short = from_date[:10]
+            print(f"  Incremental harvest from {from_short}")
+            params = {"verb": "ListRecords", "metadataPrefix": "oai_dc", "from": from_short}
+        else:
+            print("  Full harvest (first run)")
+            params = {"verb": "ListRecords", "metadataPrefix": "oai_dc"}
 
         while True:
             if limit and len(ids) >= limit:
@@ -349,69 +382,77 @@ class OAIHarvester(BaseHarvester):
                 break
             page += 1
 
-            resp = self.session.get(self.oai_url, params=params, timeout=30)
+            resp = self._get(self.oai_url, params=params, timeout=30)
             resp.raise_for_status()
             root = ET.fromstring(resp.text)
 
-            with db.get_conn() as conn:
-                for record in root.findall(".//oai:record", OAI_NS):
-                    if limit and len(ids) >= limit:
-                        break
-                    header = record.find("oai:header", OAI_NS)
-                    if header.get("status") == "deleted":
-                        continue
-                    text = self._record_text(record)
-                    kw   = self._match(text, keywords, extensions)
-                    if kw:
+            for record in root.findall(".//oai:record", OAI_NS):
+                if limit and len(ids) >= limit:
+                    break
+                header = record.find("oai:header", OAI_NS)
+                if header.get("status") == "deleted":
+                    continue
+                text = self._record_text(record)
+                kw   = self._match(text, keywords, extensions)
+                if kw:
+                    with db.get_conn() as conn:
                         pid = self._process(conn, record, kw)
-                        if pid is None:
-                            continue
-                        ids.append(pid)
-                        title = (self._fields(record, "title") or ["?"])[0][:70]
-                        print(f"  + [{kw}] {title}")
+                    if pid is None:
+                        continue
+                    ids.append(pid)
+                    title = (self._fields(record, "title") or ["?"])[0][:70]
+                    print(f"  + [{kw}] {title}")
+                    self._process_files(pid, max_file_bytes, download)
 
             token_el = root.find(".//oai:resumptionToken", OAI_NS)
             print(f"  Page {page} | {len(ids)} matches")
+
             if token_el is not None and token_el.text:
-                params = {"verb": "ListRecords", "resumptionToken": token_el.text}
+                token = token_el.text
+                # Checkpoint after every page so interruptions can resume
+                with db.get_conn() as conn:
+                    db.save_harvest_state(conn, self.repo_id, resumption_token=token)
+                params = {"verb": "ListRecords", "resumptionToken": token}
             else:
+                # Harvest complete — save timestamp, clear token
+                with db.get_conn() as conn:
+                    db.save_harvest_state(conn, self.repo_id,
+                                          last_harvested_at=run_start, resumption_token=None)
                 break
 
         print(f"  Done. {len(ids)} projects from {self.repo_url}")
         return ids
 
+    def _process_files(self, pid: int, max_file_bytes: int | None = None, download: bool = False):
+        base = self.repo_url.rstrip("/")
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT project_url, download_project_folder, query_string FROM projects WHERE id=?", (pid,)
+            ).fetchone()
+        if not row or not row["project_url"]:
+            return
+        try:
+            resp = self._get(row["project_url"], timeout=30)
+            resp.raise_for_status()
+            paths = list(dict.fromkeys(
+                re.findall(r'href="(/bitstream/[^"?]+)"', resp.text)
+            ))
+            dest_dir     = self._dest_dir(row["download_project_folder"])
+            query_string = row["query_string"] or ""
+            print(f"    {len(paths)} file(s) for project {pid}")
+            with db.get_conn() as conn:
+                for path in paths:
+                    name   = path.split("/")[-1]
+                    dl_url = f"{base}{path}"
+                    self._save_file(conn, pid, dl_url, name, dest_dir, max_file_bytes,
+                                    download=download, query_string=query_string)
+        except Exception as e:
+            print(f"  ! Project {pid} files error: {e}")
+
     def download_projects(self, project_ids: list[int], max_file_bytes: int | None = None, download: bool = True):
         print(f"\n[OAI Files] {len(project_ids)} projects from {self.repo_url}")
-        base = self.repo_url.rstrip("/")
-
         for pid in project_ids:
-            with db.get_conn() as conn:
-                row = conn.execute(
-                    "SELECT project_url, download_project_folder FROM projects WHERE id=?", (pid,)
-                ).fetchone()
-            if not row or not row["project_url"]:
-                continue
-
-            try:
-                resp = self.session.get(row["project_url"], timeout=30)
-                resp.raise_for_status()
-                paths = list(dict.fromkeys(
-                    re.findall(r'href="(/bitstream/[^"?]+)"', resp.text)
-                ))
-
-                dest_dir = self._dest_dir(row["download_project_folder"])
-                print(f"  Project {pid} — {len(paths)} file(s)")
-                with db.get_conn() as conn:
-                    qs = conn.execute("SELECT query_string FROM projects WHERE id=?", (pid,)).fetchone()
-                    query_string = qs["query_string"] if qs else ""
-                    for path in paths:
-                        name   = path.split("/")[-1]
-                        dl_url = f"{base}{path}"
-                        self._save_file(conn, pid, dl_url, name, dest_dir, max_file_bytes,
-                                        download=download, query_string=query_string)
-
-            except Exception as e:
-                print(f"  ! Project {pid} error: {e}")
+            self._process_files(pid, max_file_bytes, download)
 
     # ── OAI helpers ───────────────────────────────────────────────────────────
 
@@ -481,10 +522,12 @@ class DataverseHarvester(BaseHarvester):
         if api_token:
             self.session.headers.update({"X-Dataverse-key": api_token})
 
-    def run(self, keywords, extensions, limit) -> list[int]:
+    def run(self, keywords, extensions, limit,
+            max_file_bytes: int | None = None, download: bool = False) -> list[int]:
         seen      = set()
         ids       = []
         all_terms = list(keywords) + list(extensions)
+        run_start = self._now()
         print(f"\n[Dataverse] {self.repo_url}")
 
         for term in all_terms:
@@ -495,7 +538,7 @@ class DataverseHarvester(BaseHarvester):
                 if limit and len(ids) >= limit:
                     break
 
-                resp = self.session.get(self.api_url, params={
+                resp = self._get(self.api_url, params={
                     "q": term, "type": "dataset", "per_page": 100, "start": start,
                 }, timeout=30)
                 resp.raise_for_status()
@@ -504,72 +547,73 @@ class DataverseHarvester(BaseHarvester):
                 if not items:
                     break
 
-                with db.get_conn() as conn:
-                    for item in items:
-                        if limit and len(ids) >= limit:
-                            break
-                        url = item.get("url", "")
-                        if url in seen:
-                            continue
-                        seen.add(url)
+                for item in items:
+                    if limit and len(ids) >= limit:
+                        break
+                    url = item.get("url", "")
+                    if url in seen:
+                        continue
+                    seen.add(url)
+                    with db.get_conn() as conn:
                         pid = self._process(conn, item, term)
-                        if pid is None:
-                            continue
-                        ids.append(pid)
-                        print(f"  + [{term}] {item.get('name', '?')[:70]}")
+                    if pid is None:
+                        continue
+                    ids.append(pid)
+                    print(f"  + [{term}] {item.get('name', '?')[:70]}")
+                    self._process_files(pid, max_file_bytes, download)
 
                 start += len(items)
                 if start >= data.get("total_count", 0):
                     break
 
+        with db.get_conn() as conn:
+            db.save_harvest_state(conn, self.repo_id, last_harvested_at=run_start)
         print(f"  Done. {len(ids)} projects from {self.repo_url}")
         return ids
 
+    def _process_files(self, pid: int, max_file_bytes: int | None = None, download: bool = False):
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT doi, download_project_folder, query_string FROM projects WHERE id=?", (pid,)
+            ).fetchone()
+        if not row or not row["doi"]:
+            return
+        persistent_id = row["doi"].replace("https://doi.org/", "doi:")
+        try:
+            resp = self._get(
+                f"{self.api_base}/api/datasets/:persistentId/",
+                params={"persistentId": persistent_id}, timeout=30,
+            )
+            resp.raise_for_status()
+            files        = resp.json().get("data", {}).get("latestVersion", {}).get("files", [])
+            dest_dir     = self._dest_dir(row["download_project_folder"])
+            query_string = row["query_string"] or ""
+            has_token    = bool(self.session.headers.get("X-Dataverse-key"))
+            print(f"    {len(files)} file(s) for project {pid}")
+            with db.get_conn() as conn:
+                for entry in files:
+                    df         = entry.get("dataFile", {})
+                    file_id    = df.get("id")
+                    name       = df.get("filename", f"file_{file_id}")
+                    dl_url     = f"{self.api_base}/api/access/datafile/{file_id}"
+                    restricted = entry.get("restricted", False) or df.get("restricted", False)
+                    if restricted and not has_token:
+                        file_type = Path(name).suffix.lstrip(".").lower() or "unknown"
+                        db.insert_file(conn, pid, name, file_type, "FAILED_LOGIN_REQUIRED",
+                                       dl_url, df.get("filesize"))
+                        kb = f"{df['filesize'] // 1024} KB" if df.get("filesize") else "size unknown"
+                        print(f"    ✗ {name} [FAILED_LOGIN_REQUIRED] restricted, no token ({kb})")
+                        continue
+                    self._save_file(conn, pid, dl_url, name, dest_dir, max_file_bytes,
+                                    known_size=df.get("filesize"), download=download,
+                                    query_string=query_string)
+        except Exception as e:
+            print(f"  ! Project {pid} files error: {e}")
+
     def download_projects(self, project_ids: list[int], max_file_bytes: int | None = None, download: bool = True):
         print(f"\n[Dataverse Files] {len(project_ids)} projects from {self.repo_url}")
-
         for pid in project_ids:
-            with db.get_conn() as conn:
-                row = conn.execute(
-                    "SELECT doi, download_project_folder FROM projects WHERE id=?", (pid,)
-                ).fetchone()
-            if not row or not row["doi"]:
-                continue
-
-            persistent_id = row["doi"].replace("https://doi.org/", "doi:")
-            try:
-                resp = self.session.get(
-                    f"{self.api_base}/api/datasets/:persistentId/",
-                    params={"persistentId": persistent_id}, timeout=30,
-                )
-                resp.raise_for_status()
-                files = resp.json().get("data", {}).get("latestVersion", {}).get("files", [])
-
-                dest_dir = self._dest_dir(row["download_project_folder"])
-                print(f"  Project {pid} — {len(files)} file(s)")
-                has_token = bool(self.session.headers.get("X-Dataverse-key"))
-                with db.get_conn() as conn:
-                    qs = conn.execute("SELECT query_string FROM projects WHERE id=?", (pid,)).fetchone()
-                    query_string = qs["query_string"] if qs else ""
-                    for entry in files:
-                        df         = entry.get("dataFile", {})
-                        file_id    = df.get("id")
-                        name       = df.get("filename", f"file_{file_id}")
-                        dl_url     = f"{self.api_base}/api/access/datafile/{file_id}"
-                        restricted = entry.get("restricted", False) or df.get("restricted", False)
-                        if restricted and not has_token:
-                            file_type = Path(name).suffix.lstrip(".").lower() or "unknown"
-                            db.insert_file(conn, pid, name, file_type, "FAILED_LOGIN_REQUIRED",
-                                           dl_url, df.get("filesize"))
-                            kb = f"{df['filesize'] // 1024} KB" if df.get("filesize") else "size unknown"
-                            print(f"    ✗ {name} [FAILED_LOGIN_REQUIRED] restricted, no token ({kb})")
-                            continue
-                        self._save_file(conn, pid, dl_url, name, dest_dir, max_file_bytes,
-                                        known_size=df.get("filesize"), download=download,
-                                        query_string=query_string)
-
-            except Exception as e:
-                print(f"  ! Project {pid} error: {e}")
+            self._process_files(pid, max_file_bytes, download)
 
     def _process(self, conn, item: dict, query_string: str) -> int | None:
         url = item.get("url", "")
