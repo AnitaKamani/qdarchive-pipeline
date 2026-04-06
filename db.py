@@ -65,8 +65,9 @@ CREATE TABLE IF NOT EXISTS licenses (
 
 @contextmanager
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn
@@ -168,6 +169,19 @@ def project_exists(conn, repository_id: int, project_url: str) -> int | None:
         (repository_id, project_url),
     ).fetchone()
     return row["id"] if row else None
+
+
+def project_needs_files(conn, project_id: int) -> bool:
+    """True if project has no SUCCEEDED file rows."""
+    row = conn.execute(
+        "SELECT 1 FROM files WHERE project_id=? AND status='SUCCEEDED' LIMIT 1", (project_id,)
+    ).fetchone()
+    return row is None
+
+
+def clear_project_files(conn, project_id: int):
+    """Delete all file rows for a project so they can be re-fetched."""
+    conn.execute("DELETE FROM files WHERE project_id=?", (project_id,))
 
 
 def insert_project(conn, data: dict) -> int:

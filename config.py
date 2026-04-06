@@ -56,10 +56,17 @@ COMPRESS_EXTENSIONS = [".zip", ".tar", ".gz", ".tgz", ".tar.gz", ".bz2", ".rar",
 # An individual file inside an archive may be at most (size_limit * this) bytes
 ZIP_OVERSIZED_MULTIPLIER = 10
 
+# ── concurrency ───────────────────────────────────────────────────────────────
+
+# Number of parallel threads for file processing per repo
+MAX_WORKERS = 12
+
 # ── request behaviour ─────────────────────────────────────────────────────────
 
-# Random sleep between requests to avoid hammering servers (seconds)
-REQUEST_JITTER = (0.5, 2.0)
+# Sleep between page/harvest requests (keep small — just polite)
+HARVEST_JITTER = (0.05, 0.2)
+# Sleep between file download requests (larger — servers are more sensitive)
+DOWNLOAD_JITTER = (0.3, 1.0)
 
 # How many times to retry a repo that keeps failing before giving up
 MAX_REPO_RETRIES = 3

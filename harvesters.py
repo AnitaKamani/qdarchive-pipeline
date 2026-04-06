@@ -5,6 +5,7 @@ import tarfile
 import tempfile
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
@@ -42,9 +43,9 @@ class BaseHarvester:
 
     # ── shared helpers ────────────────────────────────────────────────────────
 
-    def _get(self, url: str, **kwargs) -> requests.Response:
+    def _get(self, url: str, jitter: tuple = None, **kwargs) -> requests.Response:
         """session.get() with jitter and 429 → RateLimitError."""
-        time.sleep(random.uniform(*config.REQUEST_JITTER))
+        time.sleep(random.uniform(*(jitter or config.HARVEST_JITTER)))
         resp = self.session.get(url, **kwargs)
         if resp.status_code == 429:
             raise RateLimitError(f"429 Too Many Requests: {url}")
@@ -107,7 +108,7 @@ class BaseHarvester:
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / file_name
         try:
-            resp = self.session.get(url, stream=True, timeout=(10, 60))
+            resp = self._get(url, jitter=config.DOWNLOAD_JITTER, stream=True, timeout=(10, 60))
             if resp.status_code in (401, 403):
                 status = "FAILED_LOGIN_REQUIRED"
                 file_size = known_size
@@ -226,7 +227,7 @@ class BaseHarvester:
         arc_dest = dest_dir / file_name
         status = "FAILED_SERVER_UNRESPONSIVE"
         try:
-            resp = self.session.get(url, stream=True, timeout=(10, 60))
+            resp = self._get(url, jitter=config.DOWNLOAD_JITTER, stream=True, timeout=(10, 60))
             if resp.status_code in (401, 403):
                 status = "FAILED_LOGIN_REQUIRED"
                 ft = suffix.lstrip(".") or "archive"
@@ -353,8 +354,8 @@ class OAIHarvester(BaseHarvester):
 
     def run(self, keywords, extensions, limit,
             max_file_bytes: int | None = None, download: bool = False) -> list[int]:
-        page     = 0
-        ids      = []
+        page      = 0
+        ids       = []
         run_start = self._now()
         print(f"\n[OAI] {self.repo_url}")
 
@@ -368,63 +369,82 @@ class OAIHarvester(BaseHarvester):
         with db.get_conn() as conn:
             db.save_harvest_state(conn, self.repo_id, last_harvested_at=run_start)
 
-        params = self._build_params(saved_token, from_date)
+        params   = self._build_params(None, from_date)
+        futures  = {}
 
-        while True:
-            if limit and len(ids) >= limit:
-                print(f"  Result limit reached ({limit}).")
-                break
-            page += 1
+        def _fetch_page(p):
+            r = self._get(self.oai_url, params=p, timeout=30)
+            r.raise_for_status()
+            return r.text
 
-            resp = self._get(self.oai_url, params=params, timeout=30)
-            resp.raise_for_status()
-            root = ET.fromstring(resp.text)
+        with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as pool:
+            # pre-fetch first page
+            next_page_future = pool.submit(_fetch_page, params)
 
-            # Check for OAI-PMH level errors (e.g. badResumptionToken)
-            error_el = root.find(".//oai:error", OAI_NS)
-            if error_el is not None:
-                code = error_el.get("code", "")
-                print(f"  OAI error: {code} — {error_el.text}")
-                if code == "badResumptionToken":
-                    print("  Token expired — falling back to incremental/full harvest")
+            while True:
+                if limit and len(ids) >= limit:
+                    print(f"  Result limit reached ({limit}).")
+                    next_page_future.cancel()
+                    break
+                page += 1
+
+                xml_text = next_page_future.result()
+                root     = ET.fromstring(xml_text)
+
+                error_el = root.find(".//oai:error", OAI_NS)
+                if error_el is not None:
+                    code = error_el.get("code", "")
+                    print(f"  OAI error: {code} — {error_el.text}")
+                    if code == "badResumptionToken":
+                        print("  Token expired — falling back to incremental/full harvest")
+                        with db.get_conn() as conn:
+                            db.save_harvest_state(conn, self.repo_id, resumption_token=None)
+                        params           = self._build_params(None, from_date)
+                        next_page_future = pool.submit(_fetch_page, params)
+                        page = 0
+                        continue
+                    break
+
+                token_el = root.find(".//oai:resumptionToken", OAI_NS)
+
+                # Pre-fetch next page immediately while we process this one
+                if token_el is not None and token_el.text:
+                    token      = token_el.text
+                    next_params = {"verb": "ListRecords", "resumptionToken": token}
+                    with db.get_conn() as conn:
+                        db.save_harvest_state(conn, self.repo_id, resumption_token=token)
+                    next_page_future = pool.submit(_fetch_page, next_params)
+                else:
+                    next_page_future = None
+
+                for record in root.findall(".//oai:record", OAI_NS):
+                    if limit and len(ids) >= limit:
+                        break
+                    header = record.find("oai:header", OAI_NS)
+                    if header.get("status") == "deleted":
+                        continue
+                    text = self._record_text(record)
+                    kw   = self._match(text, keywords, extensions)
+                    if kw:
+                        with db.get_conn() as conn:
+                            pid = self._process(conn, record, kw)
+                        if pid is None:
+                            continue
+                        ids.append(pid)
+                        title = (self._fields(record, "title") or ["?"])[0][:70]
+                        print(f"  + [{kw}] {title}")
+                        futures[pool.submit(self._process_files, pid, max_file_bytes, download)] = pid
+
+                print(f"  Page {page} | {len(ids)} matches")
+
+                if next_page_future is None:
                     with db.get_conn() as conn:
                         db.save_harvest_state(conn, self.repo_id, resumption_token=None)
-                    params = self._build_params(None, from_date)
-                    page   = 0
-                    continue
-                break
-
-            for record in root.findall(".//oai:record", OAI_NS):
-                if limit and len(ids) >= limit:
                     break
-                header = record.find("oai:header", OAI_NS)
-                if header.get("status") == "deleted":
-                    continue
-                text = self._record_text(record)
-                kw   = self._match(text, keywords, extensions)
-                if kw:
-                    with db.get_conn() as conn:
-                        pid = self._process(conn, record, kw)
-                    if pid is None:
-                        continue
-                    ids.append(pid)
-                    title = (self._fields(record, "title") or ["?"])[0][:70]
-                    print(f"  + [{kw}] {title}")
-                    self._process_files(pid, max_file_bytes, download)
 
-            token_el = root.find(".//oai:resumptionToken", OAI_NS)
-            print(f"  Page {page} | {len(ids)} matches")
-
-            if token_el is not None and token_el.text:
-                token = token_el.text
-                with db.get_conn() as conn:
-                    db.save_harvest_state(conn, self.repo_id, resumption_token=token)
-                params = {"verb": "ListRecords", "resumptionToken": token}
-            else:
-                # Harvest complete — clear token (last_harvested_at already saved above)
-                with db.get_conn() as conn:
-                    db.save_harvest_state(conn, self.repo_id, resumption_token=None)
-                break
+            for f in as_completed(futures):
+                if f.exception():
+                    print(f"  ! files error project {futures[f]}: {f.exception()}")
 
         print(f"  Done. {len(ids)} projects from {self.repo_url}")
         return ids
@@ -503,6 +523,10 @@ class OAIHarvester(BaseHarvester):
         url = self._project_url(record)
         existing = db.project_exists(conn, self.repo_id, url)
         if existing:
+            if db.project_needs_files(conn, existing):
+                db.clear_project_files(conn, existing)
+                print(f"  ~ re-fetching files for project {existing}")
+                return existing
             print(f"  ~ skipped (already in DB): {url}")
             return None
         project_id = db.insert_project(conn, {
@@ -547,41 +571,67 @@ class DataverseHarvester(BaseHarvester):
         run_start = self._now()
         print(f"\n[Dataverse] {self.repo_url}")
 
-        for term in all_terms:
-            if limit and len(ids) >= limit:
-                break
-            start = 0
-            while True:
-                if limit and len(ids) >= limit:
-                    break
+        import threading
+        seen_lock    = threading.Lock()
+        ids_lock     = threading.Lock()
+        file_futures = {}
 
-                resp = self._get(self.api_url, params={
-                    "q": term, "type": "dataset", "per_page": 100, "start": start,
-                }, timeout=30)
-                resp.raise_for_status()
-                data  = resp.json().get("data", {})
-                items = data.get("items", [])
-                if not items:
-                    break
+        def _fetch_page(term, start):
+            r = self._get(self.api_url, params={
+                "q": term, "type": "dataset", "per_page": 100, "start": start,
+            }, timeout=30)
+            r.raise_for_status()
+            return term, r.json().get("data", {})
 
-                for item in items:
+        def _process_page(term, data):
+            for item in data.get("items", []):
+                with ids_lock:
                     if limit and len(ids) >= limit:
-                        break
-                    url = item.get("url", "")
+                        return
+                url = item.get("url", "")
+                with seen_lock:
                     if url in seen:
                         continue
                     seen.add(url)
-                    with db.get_conn() as conn:
-                        pid = self._process(conn, item, term)
-                    if pid is None:
-                        continue
+                with db.get_conn() as conn:
+                    pid = self._process(conn, item, term)
+                if pid is None:
+                    continue
+                with ids_lock:
                     ids.append(pid)
-                    print(f"  + [{term}] {item.get('name', '?')[:70]}")
-                    self._process_files(pid, max_file_bytes, download)
+                print(f"  + [{term}] {item.get('name', '?')[:70]}")
+                f = file_pool.submit(self._process_files, pid, max_file_bytes, download)
+                with ids_lock:
+                    file_futures[f] = pid
 
-                start += len(items)
-                if start >= data.get("total_count", 0):
-                    break
+        with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as file_pool:
+            with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as page_pool:
+                # First fetch page 0 of every term simultaneously to get total_count
+                first_futures = {page_pool.submit(_fetch_page, t, 0): t for t in all_terms}
+                all_page_futures = {}
+                for ff in as_completed(first_futures):
+                    if ff.exception():
+                        print(f"  ! term error: {ff.exception()}")
+                        continue
+                    term, data = ff.result()
+                    total = data.get("total_count", 0)
+                    _process_page(term, data)
+                    # Submit remaining pages in parallel
+                    for start in range(100, total, 100):
+                        with ids_lock:
+                            if limit and len(ids) >= limit:
+                                break
+                        f = page_pool.submit(_fetch_page, term, start)
+                        all_page_futures[f] = term
+                for f in as_completed(all_page_futures):
+                    if f.exception():
+                        print(f"  ! page error: {f.exception()}")
+                        continue
+                    term, data = f.result()
+                    _process_page(term, data)
+            for f in as_completed(file_futures):
+                if f.exception():
+                    print(f"  ! files error project {file_futures[f]}: {f.exception()}")
 
         with db.get_conn() as conn:
             db.save_harvest_state(conn, self.repo_id, last_harvested_at=run_start)
@@ -636,6 +686,10 @@ class DataverseHarvester(BaseHarvester):
         url = item.get("url", "")
         existing = db.project_exists(conn, self.repo_id, url)
         if existing:
+            if db.project_needs_files(conn, existing):
+                db.clear_project_files(conn, existing)
+                print(f"  ~ re-fetching files for project {existing}")
+                return existing
             print(f"  ~ skipped (already in DB): {url}")
             return None
         doi = item.get("global_id", "")
