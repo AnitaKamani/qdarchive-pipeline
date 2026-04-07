@@ -75,9 +75,10 @@ if __name__ == "__main__":
     print()
 
     # ── run ───────────────────────────────────────────────────────────────────
-    db.init_db()
     if do_truncate:
         db.truncate_db()
+    else:
+        db.init_db()
 
     queue         = deque(repos)
     failures      = {}   # repo_id -> retry count
