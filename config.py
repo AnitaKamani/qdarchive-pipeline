@@ -56,6 +56,23 @@ COMPRESS_EXTENSIONS = [".zip", ".tar", ".gz", ".tgz", ".tar.gz", ".bz2", ".rar",
 # An individual file inside an archive may be at most (size_limit * this) bytes
 ZIP_OVERSIZED_MULTIPLIER = 10
 
+# ── identity ──────────────────────────────────────────────────────────────────
+
+USER_AGENT = "QDArchive-Pipeline/1.0 (research crawler; github.com/AnitaKamani/qdarchive-pipeline)"
+
+# ── resilience ────────────────────────────────────────────────────────────────
+
+# Per-request retry attempts on transient errors (timeouts, 5xx)
+REQUEST_RETRIES = 3
+
+# Max concurrent requests to the same domain
+DOMAIN_CONCURRENCY = 3
+
+# Circuit breaker: consecutive failures before a domain is paused
+CIRCUIT_BREAKER_THRESHOLD = 5
+# How long (seconds) to pause a tripped domain
+CIRCUIT_BREAKER_COOLDOWN  = 300
+
 # ── concurrency ───────────────────────────────────────────────────────────────
 
 # Number of parallel threads for file processing per repo

@@ -4,7 +4,7 @@ from collections import deque
 
 import db
 import config
-from harvesters import OAIHarvester, DataverseHarvester, RateLimitError
+from harvesters import OAIHarvester, DataverseHarvester, RateLimitError, CircuitOpenError
 
 HARVESTER_MAP = {
     "oai":       OAIHarvester,
@@ -109,7 +109,7 @@ if __name__ == "__main__":
             failures.pop(rid, None)
             backoff_until.pop(rid, None)
 
-        except RateLimitError as e:
+        except (RateLimitError, CircuitOpenError) as e:
             count = failures.get(rid, 0) + 1
             failures[rid] = count
             if count >= config.MAX_REPO_RETRIES:
@@ -117,7 +117,7 @@ if __name__ == "__main__":
             else:
                 backoff = config.REPO_RETRY_BACKOFF * (2 ** (count - 1))
                 backoff_until[rid] = time.time() + backoff
-                print(f"\n  Repo {rid} rate-limited (attempt {count}/{config.MAX_REPO_RETRIES})"
+                print(f"\n  Repo {rid} throttled (attempt {count}/{config.MAX_REPO_RETRIES})"
                       f" — retrying in {backoff}s. Moving to next repo.")
                 queue.append(repo)
 

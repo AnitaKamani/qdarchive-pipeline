@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS projects (
     download_repository_folder  TEXT    NOT NULL,
     download_project_folder     TEXT    NOT NULL,
     download_version_folder     TEXT,
-    download_method             TEXT    NOT NULL CHECK(download_method IN ('SCRAPING','API-CALL'))
+    download_method             TEXT    NOT NULL CHECK(download_method IN ('SCRAPING','API-CALL')),
+    UNIQUE(repository_id, project_url)
 );
 
 CREATE TABLE IF NOT EXISTS files (
@@ -60,14 +61,28 @@ CREATE TABLE IF NOT EXISTS licenses (
     project_id  INTEGER NOT NULL REFERENCES projects(id),
     license     TEXT    NOT NULL
 );
+
+CREATE VIEW IF NOT EXISTS v_files AS
+SELECT
+    f.id                                AS file_id,
+    f.project_id,
+    p.repository_id                     AS repo_id,
+    p.project_url,
+    f.file_url,
+    f.file_name,
+    ROUND(f.file_size / 1048576.0, 2)  AS file_size_mb,
+    f.status
+FROM files f
+JOIN projects p ON p.id = f.project_id;
 """
 
 
 @contextmanager
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn
@@ -83,6 +98,24 @@ def init_db():
     with get_conn() as conn:
         conn.executescript(SCHEMA)
         _migrate_files_table(conn)
+        _migrate_projects_unique(conn)
+        conn.executescript(SCHEMA)  # recreate views if dropped during migration
+
+
+def _migrate_projects_unique(conn):
+    """Add UNIQUE(repository_id, project_url) to projects if missing."""
+    indexes = {row[1] for row in conn.execute("PRAGMA index_list(projects)")}
+    if any("repository_id" in i or "unique" in i.lower() for i in indexes):
+        return
+    # Check via a test insert whether constraint exists
+    try:
+        conn.execute("SAVEPOINT uq")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_project "
+                     "ON projects(repository_id, project_url)")
+        conn.execute("RELEASE uq")
+    except Exception:
+        conn.execute("ROLLBACK TO uq")
+        conn.execute("RELEASE uq")
 
 
 def _migrate_files_table(conn):
@@ -106,6 +139,7 @@ def _migrate_files_table(conn):
 
     if needs_recreate:
         conn.executescript("""
+            DROP VIEW IF EXISTS v_files;
             CREATE TABLE files_new (
                 id          INTEGER PRIMARY KEY,
                 project_id  INTEGER NOT NULL REFERENCES projects(id),
@@ -127,15 +161,11 @@ def _migrate_files_table(conn):
 
 
 def truncate_db():
-    with get_conn() as conn:
-        conn.executescript("""
-            DELETE FROM licenses;
-            DELETE FROM person_role;
-            DELETE FROM keywords;
-            DELETE FROM files;
-            DELETE FROM projects;
-            DELETE FROM harvest_state;
-        """)
+    for suffix in ("", "-shm", "-wal"):
+        p = Path(DB_PATH + suffix)
+        if p.exists():
+            p.unlink()
+    init_db()
     downloads = Path("downloads")
     if downloads.exists():
         shutil.rmtree(downloads)

@@ -3,9 +3,12 @@ import random
 import re
 import tarfile
 import tempfile
+import threading
 import time
 import zipfile
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +17,8 @@ from zoneinfo import ZoneInfo
 import py7zr
 import rarfile
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import db
 import config
 
@@ -21,10 +26,48 @@ import config
 class RateLimitError(Exception):
     """Raised when a repo signals rate limiting (429) or repeated connection failures."""
 
+
+class CircuitOpenError(Exception):
+    """Raised when a domain's circuit breaker is open."""
+
+
 CET = ZoneInfo("Europe/Berlin")
 
 DOWNLOAD_ROOT  = "downloads"
 MAX_FILE_BYTES = 500 * 1024 * 1024   # 500 MB hard cap
+
+# ── domain-level controls (shared across all harvesters) ──────────────────────
+_domain_semaphores: dict[str, threading.Semaphore] = defaultdict(
+    lambda: threading.Semaphore(config.DOMAIN_CONCURRENCY)
+)
+_circuit_failures:  dict[str, int]   = defaultdict(int)
+_circuit_open_until: dict[str, float] = defaultdict(float)
+_circuit_lock = threading.Lock()
+
+
+def _domain(url: str) -> str:
+    return urlparse(url).netloc
+
+
+def _check_circuit(domain: str):
+    with _circuit_lock:
+        if time.time() < _circuit_open_until[domain]:
+            raise CircuitOpenError(f"Circuit open for {domain}")
+
+
+def _record_failure(domain: str):
+    with _circuit_lock:
+        _circuit_failures[domain] += 1
+        if _circuit_failures[domain] >= config.CIRCUIT_BREAKER_THRESHOLD:
+            _circuit_open_until[domain] = time.time() + config.CIRCUIT_BREAKER_COOLDOWN
+            _circuit_failures[domain]   = 0
+            print(f"  ⚡ Circuit tripped for {domain} — pausing {config.CIRCUIT_BREAKER_COOLDOWN}s")
+
+
+def _record_success(domain: str):
+    with _circuit_lock:
+        _circuit_failures[domain] = 0
+
 
 # ── base ──────────────────────────────────────────────────────────────────────
 
@@ -33,7 +76,22 @@ class BaseHarvester:
         self.repo_id     = repo_id
         self.repo_url    = repo_url
         self.repo_folder = repo_folder
-        self.session     = requests.Session()
+        self.session     = self._make_session()
+
+    def _make_session(self) -> requests.Session:
+        session = requests.Session()
+        session.headers["User-Agent"] = config.USER_AGENT
+        retry = Retry(
+            total=config.REQUEST_RETRIES,
+            backoff_factor=1.0,
+            status_forcelist={500, 502, 503, 504},
+            allowed_methods={"GET", "HEAD"},
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("https://", adapter)
+        session.mount("http://",  adapter)
+        return session
 
     def run(self, keywords, extensions, limit) -> list[int]:
         raise NotImplementedError
@@ -44,12 +102,32 @@ class BaseHarvester:
     # ── shared helpers ────────────────────────────────────────────────────────
 
     def _get(self, url: str, jitter: tuple = None, **kwargs) -> requests.Response:
-        """session.get() with jitter and 429 → RateLimitError."""
-        time.sleep(random.uniform(*(jitter or config.HARVEST_JITTER)))
-        resp = self.session.get(url, **kwargs)
+        """Polite get: circuit check → domain semaphore → jitter → request → circuit record."""
+        domain = _domain(url)
+        _check_circuit(domain)
+        with _domain_semaphores[domain]:
+            time.sleep(random.uniform(*(jitter or config.HARVEST_JITTER)))
+            resp = self.session.get(url, **kwargs)
         if resp.status_code == 429:
+            _record_failure(domain)
             raise RateLimitError(f"429 Too Many Requests: {url}")
+        if resp.status_code >= 500:
+            _record_failure(domain)
+        else:
+            _record_success(domain)
         return resp
+
+    def _head(self, url: str) -> requests.Response:
+        """HEAD with circuit check, domain semaphore, and circuit recording."""
+        domain = _domain(url)
+        _check_circuit(domain)
+        with _domain_semaphores[domain]:
+            r = self.session.head(url, timeout=(10, 15), allow_redirects=True)
+        if r.status_code >= 500:
+            _record_failure(domain)
+        else:
+            _record_success(domain)
+        return r
 
     def _match(self, text: str, keywords, extensions) -> str | None:
         text = text.lower()
@@ -85,7 +163,7 @@ class BaseHarvester:
             size = known_size
             if size is None:
                 try:
-                    r = self.session.head(url, timeout=(10, 15), allow_redirects=True)
+                    r = self._head(url)
                     cl = r.headers.get("content-length")
                     if cl:
                         size = int(cl)
@@ -114,7 +192,7 @@ class BaseHarvester:
                 file_size = known_size
                 if file_size is None:
                     try:
-                        r = self.session.head(url, timeout=(10, 15), allow_redirects=True)
+                        r = self._head(url)
                         cl = r.headers.get("content-length")
                         if cl:
                             file_size = int(cl)
@@ -403,6 +481,16 @@ class OAIHarvester(BaseHarvester):
                         next_page_future = pool.submit(_fetch_page, params)
                         page = 0
                         continue
+                    if code == "noRecordsMatch" and from_date:
+                        print("  No new records since last run — falling back to full harvest")
+                        with db.get_conn() as conn:
+                            db.save_harvest_state(conn, self.repo_id,
+                                                  last_harvested_at=None, resumption_token=None)
+                        params           = self._build_params(None, None)
+                        next_page_future = pool.submit(_fetch_page, params)
+                        from_date        = None
+                        page             = 0
+                        continue
                     break
 
                 token_el = root.find(".//oai:resumptionToken", OAI_NS)
@@ -427,10 +515,12 @@ class OAIHarvester(BaseHarvester):
                     kw   = self._match(text, keywords, extensions)
                     if kw:
                         with db.get_conn() as conn:
-                            pid = self._process(conn, record, kw)
-                        if pid is None:
+                            result = self._process(conn, record, kw)
+                        if result is None:
                             continue
-                        ids.append(pid)
+                        pid, is_new = result
+                        if is_new:
+                            ids.append(pid)
                         title = (self._fields(record, "title") or ["?"])[0][:70]
                         print(f"  + [{kw}] {title}")
                         futures[pool.submit(self._process_files, pid, max_file_bytes, download)] = pid
@@ -519,14 +609,15 @@ class OAIHarvester(BaseHarvester):
                 return f"https://doi.org/{raw}"
         return None
 
-    def _process(self, conn, record, query_string: str) -> int | None:
+    def _process(self, conn, record, query_string: str) -> tuple[int, bool] | None:
+        """Returns (pid, is_new) or None to skip entirely."""
         url = self._project_url(record)
         existing = db.project_exists(conn, self.repo_id, url)
         if existing:
             if db.project_needs_files(conn, existing):
                 db.clear_project_files(conn, existing)
                 print(f"  ~ re-fetching files for project {existing}")
-                return existing
+                return existing, False   # not new — don't count against limit
             print(f"  ~ skipped (already in DB): {url}")
             return None
         project_id = db.insert_project(conn, {
@@ -550,7 +641,7 @@ class OAIHarvester(BaseHarvester):
         for name in self._fields(record, "creator"):     db.insert_person(conn, project_id, name, "AUTHOR")
         for name in self._fields(record, "contributor"): db.insert_person(conn, project_id, name, "OTHER")
         for lic  in self._fields(record, "rights"):      db.insert_license(conn, project_id, lic)
-        return project_id
+        return project_id, True   # new insert
 
 
 # ── Dataverse ─────────────────────────────────────────────────────────────────
@@ -594,11 +685,13 @@ class DataverseHarvester(BaseHarvester):
                         continue
                     seen.add(url)
                 with db.get_conn() as conn:
-                    pid = self._process(conn, item, term)
-                if pid is None:
+                    result = self._process(conn, item, term)
+                if result is None:
                     continue
-                with ids_lock:
-                    ids.append(pid)
+                pid, is_new = result
+                if is_new:
+                    with ids_lock:
+                        ids.append(pid)
                 print(f"  + [{term}] {item.get('name', '?')[:70]}")
                 f = file_pool.submit(self._process_files, pid, max_file_bytes, download)
                 with ids_lock:
@@ -657,23 +750,38 @@ class DataverseHarvester(BaseHarvester):
             query_string = row["query_string"] or ""
             has_token    = bool(self.session.headers.get("X-Dataverse-key"))
             print(f"    {len(files)} file(s) for project {pid}")
-            with db.get_conn() as conn:
-                for entry in files:
-                    df         = entry.get("dataFile", {})
-                    file_id    = df.get("id")
-                    name       = df.get("filename", f"file_{file_id}")
-                    dl_url     = f"{self.api_base}/api/access/datafile/{file_id}"
-                    restricted = entry.get("restricted", False) or df.get("restricted", False)
-                    if restricted and not has_token:
-                        file_type = Path(name).suffix.lstrip(".").lower() or "unknown"
-                        db.insert_file(conn, pid, name, file_type, "FAILED_LOGIN_REQUIRED",
-                                       dl_url, df.get("filesize"))
-                        kb = f"{df['filesize'] // 1024} KB" if df.get("filesize") else "size unknown"
-                        print(f"    ✗ {name} [FAILED_LOGIN_REQUIRED] restricted, no token ({kb})")
-                        continue
-                    self._save_file(conn, pid, dl_url, name, dest_dir, max_file_bytes,
-                                    known_size=df.get("filesize"), download=download,
-                                    query_string=query_string)
+            for entry in files:
+                df         = entry.get("dataFile", {})
+                file_id    = df.get("id")
+                name       = df.get("filename", f"file_{file_id}")
+                dl_url     = f"{self.api_base}/api/access/datafile/{file_id}"
+                file_type  = Path(name).suffix.lstrip(".").lower() or "unknown"
+                known_size = df.get("filesize")
+                # inaccessible: file is restricted and we have no token
+                # (fileAccessRequest is a dataset-level feature flag, not a file access requirement)
+                inaccessible = (
+                    (entry.get("restricted") or df.get("restricted")) and not has_token
+                )
+                try:
+                    if inaccessible:
+                        with db.get_conn() as conn:
+                            db.insert_file(conn, pid, name, file_type, "FAILED_LOGIN_REQUIRED",
+                                           dl_url, known_size)
+                        kb = f"{known_size // 1024} KB" if known_size else "size unknown"
+                        print(f"    ✗ {name} [FAILED_LOGIN_REQUIRED] ({kb})")
+                    else:
+                        with db.get_conn() as conn:
+                            self._save_file(conn, pid, dl_url, name, dest_dir, max_file_bytes,
+                                            known_size=known_size, download=download,
+                                            query_string=query_string)
+                except Exception as e:
+                    print(f"    ! {name} error: {e}")
+                    try:
+                        with db.get_conn() as conn:
+                            db.insert_file(conn, pid, name, file_type,
+                                           "FAILED_SERVER_UNRESPONSIVE", dl_url, known_size)
+                    except Exception:
+                        pass
         except Exception as e:
             print(f"  ! Project {pid} files error: {e}")
 
@@ -682,14 +790,15 @@ class DataverseHarvester(BaseHarvester):
         for pid in project_ids:
             self._process_files(pid, max_file_bytes, download)
 
-    def _process(self, conn, item: dict, query_string: str) -> int | None:
+    def _process(self, conn, item: dict, query_string: str) -> tuple[int, bool] | None:
+        """Returns (pid, is_new) or None to skip entirely."""
         url = item.get("url", "")
         existing = db.project_exists(conn, self.repo_id, url)
         if existing:
             if db.project_needs_files(conn, existing):
                 db.clear_project_files(conn, existing)
                 print(f"  ~ re-fetching files for project {existing}")
-                return existing
+                return existing, False   # not new — don't count against limit
             print(f"  ~ skipped (already in DB): {url}")
             return None
         doi = item.get("global_id", "")
@@ -718,4 +827,4 @@ class DataverseHarvester(BaseHarvester):
         for auth in item.get("authors", []):
             name = auth.get("name", "") if isinstance(auth, dict) else str(auth)
             if name: db.insert_person(conn, project_id, name, "AUTHOR")
-        return project_id
+        return project_id, True   # new insert

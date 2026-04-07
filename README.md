@@ -43,7 +43,7 @@ You will be prompted for:
 
 ## Database
 
-SQLite file: `qdarchive.db` — 5 tables:
+SQLite file: `qdarchive.db` — 6 tables, 1 view:
 
 | Table | Description |
 |-------|-------------|
@@ -52,8 +52,15 @@ SQLite file: `qdarchive.db` — 5 tables:
 | `keywords` | Subject keywords per project |
 | `person_role` | Authors, uploaders, contributors |
 | `licenses` | License info per project |
+| `harvest_state` | Incremental harvest checkpoint per repository |
+
+| View | Description |
+|------|-------------|
+| `v_files` | Files joined with project URL, repo ID, and size in MB |
 
 File download statuses: `SUCCEEDED`, `NOT_ATTEMPTED`, `FAILED_LOGIN_REQUIRED`, `FAILED_TOO_LARGE`, `FAILED_SERVER_UNRESPONSIVE`
+
+> **Truncate** — choosing "Truncate database" at startup deletes the `.db` file entirely and recreates it from scratch, including all tables and views.
 
 ## Downloads
 
