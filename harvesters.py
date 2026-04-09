@@ -18,6 +18,7 @@ import py7zr
 import rarfile
 import requests
 from requests.adapters import HTTPAdapter
+from tqdm import tqdm
 from urllib3.util.retry import Retry
 import db
 import config
@@ -77,6 +78,15 @@ class BaseHarvester:
         self.repo_url    = repo_url
         self.repo_folder = repo_folder
         self.session     = self._make_session()
+        self.show_bar    = False   # set by run() before threads start
+
+    def _log(self, msg: str, force: bool = False):
+        """Print msg. In bar mode only force=True messages are shown (via tqdm.write)."""
+        if self.show_bar:
+            if force:
+                tqdm.write(msg)
+        else:
+            print(msg)
 
     def _make_session(self) -> requests.Session:
         session = requests.Session()
@@ -171,7 +181,7 @@ class BaseHarvester:
                     pass
             db.insert_file(conn, project_id, file_name, file_type, "NOT_ATTEMPTED", url, size)
             kb = f"{size // 1024} KB" if size else "size unknown"
-            print(f"    - {file_name} [NOT_ATTEMPTED] ({kb})")
+            self._log(f"    - {file_name} [NOT_ATTEMPTED] ({kb})")
             return
 
         status    = "FAILED_SERVER_UNRESPONSIVE"
@@ -180,7 +190,7 @@ class BaseHarvester:
         if cap and known_size and known_size > cap:
             status = "FAILED_TOO_LARGE"
             db.insert_file(conn, project_id, file_name, file_type, status, url, known_size)
-            print(f"    ✗ {file_name} [FAILED_TOO_LARGE] (metadata: {known_size // 1024} KB)")
+            self._log(f"    ✗ {file_name} [FAILED_TOO_LARGE] (metadata: {known_size // 1024} KB)")
             return
 
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -223,7 +233,7 @@ class BaseHarvester:
 
         db.insert_file(conn, project_id, file_name, file_type, status, url, file_size)
         icon = "✓" if status == "SUCCEEDED" else "✗"
-        print(f"    {icon} {file_name} [{status}]")
+        self._log(f"    {icon} {file_name} [{status}]")
 
     def _handle_archive(self, conn, project_id: int, url: str, file_name: str,
                         dest_dir: Path, cap: int, known_size: int | None,
@@ -253,18 +263,18 @@ class BaseHarvester:
                 # couldn't peek — record the archive itself
                 db.insert_file(conn, project_id, file_name, suffix.lstrip(".") or "archive",
                                "NOT_ATTEMPTED", url, arc_size)
-                print(f"    - {file_name} [NOT_ATTEMPTED] (archive, could not peek)")
+                self._log(f"    - {file_name} [NOT_ATTEMPTED] (archive, could not peek)")
                 return
             relevant = [f for f in inner if Path(f['name']).suffix.lower() in extensions]
             to_record = relevant if not by_keyword else inner
             if not to_record and not by_keyword:
-                print(f"    - {file_name} skipped (archive, no relevant files inside)")
+                self._log(f"    - {file_name} skipped (archive, no relevant files inside)")
                 return
             for f in to_record:
                 ft = Path(f['name']).suffix.lstrip(".").lower() or "unknown"
                 db.insert_file(conn, project_id, f['name'], ft, "NOT_ATTEMPTED",
                                url, f['size'], zip_path=file_name)
-                print(f"    - {f['name']} [NOT_ATTEMPTED] in {file_name}")
+                self._log(f"    - {f['name']} [NOT_ATTEMPTED] in {file_name}")
             return
 
         # --- downloading ---
@@ -274,21 +284,21 @@ class BaseHarvester:
         if inner is not None:
             relevant = [f for f in inner if Path(f['name']).suffix.lower() in extensions]
             if not by_keyword and not relevant:
-                print(f"    - {file_name} skipped (no relevant files inside)")
+                self._log(f"    - {file_name} skipped (no relevant files inside)")
                 return
             file_count = len(inner)
             # aggregate size check
             if cap and arc_size and arc_size > file_count * cap:
                 ft = suffix.lstrip(".") or "archive"
                 db.insert_file(conn, project_id, file_name, ft, "FAILED_TOO_LARGE", url, arc_size)
-                print(f"    ✗ {file_name} [FAILED_TOO_LARGE] archive too large")
+                self._log(f"    ✗ {file_name} [FAILED_TOO_LARGE] archive too large")
                 return
             # individual file check
             oversized = [f for f in inner if cap and f['size'] and f['size'] > cap * multiplier]
             if oversized:
                 ft = suffix.lstrip(".") or "archive"
                 db.insert_file(conn, project_id, file_name, ft, "FAILED_TOO_LARGE", url, arc_size)
-                print(f"    ✗ {file_name} [FAILED_TOO_LARGE] contains oversized file(s)")
+                self._log(f"    ✗ {file_name} [FAILED_TOO_LARGE] contains oversized file(s)")
                 return
             to_record = relevant if not by_keyword else inner
         else:
@@ -296,7 +306,7 @@ class BaseHarvester:
             if cap and arc_size and arc_size > cap * multiplier:
                 ft = suffix.lstrip(".") or "archive"
                 db.insert_file(conn, project_id, file_name, ft, "FAILED_TOO_LARGE", url, arc_size)
-                print(f"    ✗ {file_name} [FAILED_TOO_LARGE]")
+                self._log(f"    ✗ {file_name} [FAILED_TOO_LARGE]")
                 return
             to_record = None  # record all after download
 
@@ -310,7 +320,7 @@ class BaseHarvester:
                 status = "FAILED_LOGIN_REQUIRED"
                 ft = suffix.lstrip(".") or "archive"
                 db.insert_file(conn, project_id, file_name, ft, status, url, arc_size)
-                print(f"    ✗ {file_name} [{status}]")
+                self._log(f"    ✗ {file_name} [{status}]")
                 return
             resp.raise_for_status()
             size = 0
@@ -322,7 +332,7 @@ class BaseHarvester:
         except Exception:
             ft = suffix.lstrip(".") or "archive"
             db.insert_file(conn, project_id, file_name, ft, status, url, arc_size)
-            print(f"    ✗ {file_name} [{status}]")
+            self._log(f"    ✗ {file_name} [{status}]")
             return
 
         # If we couldn't peek before, read inner listing now from downloaded file
@@ -333,7 +343,7 @@ class BaseHarvester:
                 to_record = relevant if not by_keyword else inner
                 if not by_keyword and not to_record:
                     arc_dest.unlink(missing_ok=True)
-                    print(f"    - {file_name} deleted (no relevant files inside)")
+                    self._log(f"    - {file_name} deleted (no relevant files inside)")
                     return
             else:
                 to_record = [{"name": file_name, "size": size}]
@@ -343,7 +353,7 @@ class BaseHarvester:
             ft = Path(f['name']).suffix.lstrip(".").lower() or "unknown"
             db.insert_file(conn, project_id, f['name'], ft, "SUCCEEDED",
                            url, f['size'], zip_path=zip_path_str)
-        print(f"    ✓ {file_name} [SUCCEEDED] — {len(to_record)} inner file(s) recorded")
+        self._log(f"    ✓ {file_name} [SUCCEEDED] — {len(to_record)} inner file(s) recorded")
 
     def _peek_archive(self, url: str, suffix: str, arc_size: int | None,
                       cap: int, multiplier: int) -> list[dict] | None:
@@ -431,29 +441,23 @@ class OAIHarvester(BaseHarvester):
         self.oai_url = oai_url
 
     def run(self, keywords, extensions, limit,
-            max_file_bytes: int | None = None, download: bool = False) -> list[int]:
-        page      = 0
-        ids       = []
-        run_start = self._now()
-        print(f"\n[OAI] {self.repo_url}")
+            max_file_bytes: int | None = None, download: bool = False,
+            show_bar: bool = False) -> list[int]:
+        page          = 0
+        ids           = []
+        self.show_bar = show_bar
+        self._log(f"\n[OAI] {self.repo_url}", force=True)
 
-        # Load checkpoint
-        with db.get_conn() as conn:
-            state = db.get_harvest_state(conn, self.repo_id)
-        saved_token = state["resumption_token"]
-        from_date   = state["last_harvested_at"]
-
-        # Save run_start now — even if interrupted, next run can use it as `from`
-        with db.get_conn() as conn:
-            db.save_harvest_state(conn, self.repo_id, last_harvested_at=run_start)
-
-        params   = self._build_params(None, from_date)
-        futures  = {}
+        params  = {"verb": "ListRecords", "metadataPrefix": "oai_dc"}
+        futures = {}
 
         def _fetch_page(p):
             r = self._get(self.oai_url, params=p, timeout=30)
             r.raise_for_status()
             return r.text
+
+        pbar = tqdm(total=None, unit="page", desc=self.repo_folder,
+                    disable=not show_bar, dynamic_ncols=True)
 
         with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as pool:
             # pre-fetch first page
@@ -461,7 +465,7 @@ class OAIHarvester(BaseHarvester):
 
             while True:
                 if limit and len(ids) >= limit:
-                    print(f"  Result limit reached ({limit}).")
+                    self._log(f"  Result limit reached ({limit}).", force=True)
                     next_page_future.cancel()
                     break
                 page += 1
@@ -471,41 +475,20 @@ class OAIHarvester(BaseHarvester):
 
                 error_el = root.find(".//oai:error", OAI_NS)
                 if error_el is not None:
-                    code = error_el.get("code", "")
-                    print(f"  OAI error: {code} — {error_el.text}")
-                    if code == "badResumptionToken":
-                        print("  Token expired — falling back to incremental/full harvest")
-                        with db.get_conn() as conn:
-                            db.save_harvest_state(conn, self.repo_id, resumption_token=None)
-                        params           = self._build_params(None, from_date)
-                        next_page_future = pool.submit(_fetch_page, params)
-                        page = 0
-                        continue
-                    if code == "noRecordsMatch" and from_date:
-                        print("  No new records since last run — falling back to full harvest")
-                        with db.get_conn() as conn:
-                            db.save_harvest_state(conn, self.repo_id,
-                                                  last_harvested_at=None, resumption_token=None)
-                        params           = self._build_params(None, None)
-                        next_page_future = pool.submit(_fetch_page, params)
-                        from_date        = None
-                        page             = 0
-                        continue
+                    self._log(f"  OAI error: {error_el.get('code', '')} — {error_el.text}", force=True)
                     break
 
                 token_el = root.find(".//oai:resumptionToken", OAI_NS)
 
                 # Pre-fetch next page immediately while we process this one
                 if token_el is not None and token_el.text:
-                    token      = token_el.text
-                    next_params = {"verb": "ListRecords", "resumptionToken": token}
-                    with db.get_conn() as conn:
-                        db.save_harvest_state(conn, self.repo_id, resumption_token=token)
+                    next_params      = {"verb": "ListRecords", "resumptionToken": token_el.text}
                     next_page_future = pool.submit(_fetch_page, next_params)
                 else:
                     next_page_future = None
 
-                for record in root.findall(".//oai:record", OAI_NS):
+                records = root.findall(".//oai:record", OAI_NS)
+                for record in records:
                     if limit and len(ids) >= limit:
                         break
                     header = record.find("oai:header", OAI_NS)
@@ -522,21 +505,22 @@ class OAIHarvester(BaseHarvester):
                         if is_new:
                             ids.append(pid)
                         title = (self._fields(record, "title") or ["?"])[0][:70]
-                        print(f"  + [{kw}] {title}")
+                        self._log(f"  + [{kw}] {title}")
                         futures[pool.submit(self._process_files, pid, max_file_bytes, download)] = pid
 
-                print(f"  Page {page} | {len(ids)} matches")
+                pbar.update(1)
+                pbar.set_postfix(found=len(ids), limit=limit or "∞")
+                self._log(f"  Page {page} | {len(ids)} matches")
 
                 if next_page_future is None:
-                    with db.get_conn() as conn:
-                        db.save_harvest_state(conn, self.repo_id, resumption_token=None)
                     break
 
             for f in as_completed(futures):
                 if f.exception():
-                    print(f"  ! files error project {futures[f]}: {f.exception()}")
+                    self._log(f"  ! files error project {futures[f]}: {f.exception()}", force=True)
 
-        print(f"  Done. {len(ids)} projects from {self.repo_url}")
+        pbar.close()
+        self._log(f"  Done. {len(ids)} projects from {self.repo_url}", force=True)
         return ids
 
     def _process_files(self, pid: int, max_file_bytes: int | None = None, download: bool = False):
@@ -555,7 +539,7 @@ class OAIHarvester(BaseHarvester):
             ))
             dest_dir     = self._dest_dir(row["download_project_folder"])
             query_string = row["query_string"] or ""
-            print(f"    {len(paths)} file(s) for project {pid}")
+            self._log(f"    {len(paths)} file(s) for project {pid}")
             with db.get_conn() as conn:
                 for path in paths:
                     name   = path.split("/")[-1]
@@ -563,23 +547,12 @@ class OAIHarvester(BaseHarvester):
                     self._save_file(conn, pid, dl_url, name, dest_dir, max_file_bytes,
                                     download=download, query_string=query_string)
         except Exception as e:
-            print(f"  ! Project {pid} files error: {e}")
+            self._log(f"  ! Project {pid} files error: {e}", force=True)
 
     def download_projects(self, project_ids: list[int], max_file_bytes: int | None = None, download: bool = True):
         print(f"\n[OAI Files] {len(project_ids)} projects from {self.repo_url}")
         for pid in project_ids:
             self._process_files(pid, max_file_bytes, download)
-
-    def _build_params(self, token: str | None, from_date: str | None) -> dict:
-        if token:
-            print(f"  Resuming from checkpoint token")
-            return {"verb": "ListRecords", "resumptionToken": token}
-        if from_date:
-            from_short = from_date[:10]
-            print(f"  Incremental harvest from {from_short}")
-            return {"verb": "ListRecords", "metadataPrefix": "oai_dc", "from": from_short}
-        print("  Full harvest (first run)")
-        return {"verb": "ListRecords", "metadataPrefix": "oai_dc"}
 
     # ── OAI helpers ───────────────────────────────────────────────────────────
 
@@ -616,9 +589,9 @@ class OAIHarvester(BaseHarvester):
         if existing:
             if db.project_needs_files(conn, existing):
                 db.clear_project_files(conn, existing)
-                print(f"  ~ re-fetching files for project {existing}")
+                self._log(f"  ~ re-fetching files for project {existing}")
                 return existing, False   # not new — don't count against limit
-            print(f"  ~ skipped (already in DB): {url}")
+            self._log(f"  ~ skipped (already in DB): {url}")
             return None
         project_id = db.insert_project(conn, {
             "query_string":               query_string,
@@ -655,17 +628,21 @@ class DataverseHarvester(BaseHarvester):
             self.session.headers.update({"X-Dataverse-key": api_token})
 
     def run(self, keywords, extensions, limit,
-            max_file_bytes: int | None = None, download: bool = False) -> list[int]:
-        seen      = set()
-        ids       = []
-        all_terms = list(keywords) + list(extensions)
-        run_start = self._now()
-        print(f"\n[Dataverse] {self.repo_url}")
+            max_file_bytes: int | None = None, download: bool = False,
+            show_bar: bool = False) -> list[int]:
+        seen          = set()
+        ids           = []
+        all_terms     = list(keywords) + list(extensions)
+        self.show_bar = show_bar
+        self._log(f"\n[Dataverse] {self.repo_url}", force=True)
 
         import threading
         seen_lock    = threading.Lock()
         ids_lock     = threading.Lock()
         file_futures = {}
+
+        pbar = tqdm(total=None, unit="page", desc=self.repo_folder,
+                    disable=not show_bar, dynamic_ncols=True)
 
         def _fetch_page(term, start):
             r = self._get(self.api_url, params={
@@ -675,6 +652,8 @@ class DataverseHarvester(BaseHarvester):
             return term, r.json().get("data", {})
 
         def _process_page(term, data):
+            pbar.update(1)
+            pbar.set_postfix(found=len(ids), limit=limit or "∞")
             for item in data.get("items", []):
                 with ids_lock:
                     if limit and len(ids) >= limit:
@@ -692,7 +671,7 @@ class DataverseHarvester(BaseHarvester):
                 if is_new:
                     with ids_lock:
                         ids.append(pid)
-                print(f"  + [{term}] {item.get('name', '?')[:70]}")
+                self._log(f"  + [{term}] {item.get('name', '?')[:70]}")
                 f = file_pool.submit(self._process_files, pid, max_file_bytes, download)
                 with ids_lock:
                     file_futures[f] = pid
@@ -704,13 +683,15 @@ class DataverseHarvester(BaseHarvester):
                 all_page_futures = {}
                 for ff in as_completed(first_futures):
                     if ff.exception():
-                        print(f"  ! term error: {ff.exception()}")
+                        self._log(f"  ! term error: {ff.exception()}", force=True)
                         continue
                     term, data = ff.result()
                     total = data.get("total_count", 0)
                     _process_page(term, data)
-                    # Submit remaining pages in parallel
-                    for start in range(100, total, 100):
+                    # Submit remaining pages in random order
+                    offsets = list(range(100, total, 100))
+                    random.shuffle(offsets)
+                    for start in offsets:
                         with ids_lock:
                             if limit and len(ids) >= limit:
                                 break
@@ -718,17 +699,16 @@ class DataverseHarvester(BaseHarvester):
                         all_page_futures[f] = term
                 for f in as_completed(all_page_futures):
                     if f.exception():
-                        print(f"  ! page error: {f.exception()}")
+                        self._log(f"  ! page error: {f.exception()}", force=True)
                         continue
                     term, data = f.result()
                     _process_page(term, data)
             for f in as_completed(file_futures):
                 if f.exception():
-                    print(f"  ! files error project {file_futures[f]}: {f.exception()}")
+                    self._log(f"  ! files error project {file_futures[f]}: {f.exception()}", force=True)
 
-        with db.get_conn() as conn:
-            db.save_harvest_state(conn, self.repo_id, last_harvested_at=run_start)
-        print(f"  Done. {len(ids)} projects from {self.repo_url}")
+        pbar.close()
+        self._log(f"  Done. {len(ids)} projects from {self.repo_url}", force=True)
         return ids
 
     def _process_files(self, pid: int, max_file_bytes: int | None = None, download: bool = False):
@@ -749,7 +729,7 @@ class DataverseHarvester(BaseHarvester):
             dest_dir     = self._dest_dir(row["download_project_folder"])
             query_string = row["query_string"] or ""
             has_token    = bool(self.session.headers.get("X-Dataverse-key"))
-            print(f"    {len(files)} file(s) for project {pid}")
+            self._log(f"    {len(files)} file(s) for project {pid}")
             for entry in files:
                 df         = entry.get("dataFile", {})
                 file_id    = df.get("id")
@@ -768,7 +748,7 @@ class DataverseHarvester(BaseHarvester):
                             db.insert_file(conn, pid, name, file_type, "FAILED_LOGIN_REQUIRED",
                                            dl_url, known_size)
                         kb = f"{known_size // 1024} KB" if known_size else "size unknown"
-                        print(f"    ✗ {name} [FAILED_LOGIN_REQUIRED] ({kb})")
+                        self._log(f"    ✗ {name} [FAILED_LOGIN_REQUIRED] ({kb})")
                     else:
                         with db.get_conn() as conn:
                             self._save_file(conn, pid, dl_url, name, dest_dir, max_file_bytes,
@@ -783,7 +763,7 @@ class DataverseHarvester(BaseHarvester):
                     except Exception:
                         pass
         except Exception as e:
-            print(f"  ! Project {pid} files error: {e}")
+            self._log(f"  ! Project {pid} files error: {e}", force=True)
 
     def download_projects(self, project_ids: list[int], max_file_bytes: int | None = None, download: bool = True):
         print(f"\n[Dataverse Files] {len(project_ids)} projects from {self.repo_url}")
@@ -797,9 +777,9 @@ class DataverseHarvester(BaseHarvester):
         if existing:
             if db.project_needs_files(conn, existing):
                 db.clear_project_files(conn, existing)
-                print(f"  ~ re-fetching files for project {existing}")
+                self._log(f"  ~ re-fetching files for project {existing}")
                 return existing, False   # not new — don't count against limit
-            print(f"  ~ skipped (already in DB): {url}")
+            self._log(f"  ~ skipped (already in DB): {url}")
             return None
         doi = item.get("global_id", "")
         if doi and not doi.startswith("http"):

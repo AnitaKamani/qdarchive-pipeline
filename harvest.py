@@ -72,6 +72,8 @@ if __name__ == "__main__":
                 max_file_mb = int(float(raw_mb) * 1024 * 1024)
             except ValueError:
                 print("   Invalid input, using no limit.")
+    mode         = input("4. Output mode? [bar/detail, Enter = bar]: ").strip().lower()
+    show_bar     = mode != "detail"
 
     print()
 
@@ -110,7 +112,7 @@ if __name__ == "__main__":
             cls       = HARVESTER_MAP[repo["type"]]
             harvester = cls(**{k: v for k, v in repo.items() if k != "type"})
             harvester.run(config.KEYWORDS, config.QDA_EXTENSIONS, limit,
-                          max_file_bytes=max_file_mb, download=do_download)
+                          max_file_bytes=max_file_mb, download=do_download, show_bar=show_bar)
             # success — clear failure state
             failures.pop(rid, None)
             backoff_until.pop(rid, None)

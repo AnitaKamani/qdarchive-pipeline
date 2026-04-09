@@ -40,10 +40,11 @@ You will be prompted for:
 2. Truncate database first?
 3. Max results per repo (Enter = no limit)
 4. Download files? (if yes: max file size in MB)
+5. Output mode: `bar` (default) shows a tqdm progress bar; `detail` shows per-item verbose output
 
 ## Database
 
-SQLite file: `qdarchive.db` — 6 tables, 1 view:
+SQLite file: `qdarchive.db` — 5 tables, 1 view:
 
 | Table | Description |
 |-------|-------------|
@@ -52,7 +53,6 @@ SQLite file: `qdarchive.db` — 6 tables, 1 view:
 | `keywords` | Subject keywords per project |
 | `person_role` | Authors, uploaders, contributors |
 | `licenses` | License info per project |
-| `harvest_state` | Incremental harvest checkpoint per repository |
 
 | View | Description |
 |------|-------------|
