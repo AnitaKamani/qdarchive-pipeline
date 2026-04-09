@@ -1,6 +1,7 @@
 import sys
 import time
 from collections import deque
+from datetime import datetime
 
 import db
 import config
@@ -75,6 +76,10 @@ if __name__ == "__main__":
     print()
 
     # ── run ───────────────────────────────────────────────────────────────────
+    start_time = time.time()
+    start_dt   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"Began: {start_dt}\n")
+
     if do_truncate:
         db.truncate_db()
     else:
@@ -124,3 +129,17 @@ if __name__ == "__main__":
 
         except Exception as e:
             print(f"\n  Repo {rid} error: {e}")
+
+    end_dt  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    elapsed = int(time.time() - start_time)
+    days, rem       = divmod(elapsed, 86400)
+    hours, rem      = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    parts = []
+    if days:    parts.append(f"{days}d")
+    if hours:   parts.append(f"{hours}h")
+    if minutes: parts.append(f"{minutes}m")
+    parts.append(f"{seconds}s")
+    print(f"\nBegan:    {start_dt}")
+    print(f"Ended:    {end_dt}")
+    print(f"Duration: {' '.join(parts)}")
