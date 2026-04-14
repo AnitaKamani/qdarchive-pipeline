@@ -56,6 +56,11 @@ COMPRESS_EXTENSIONS = [".zip", ".tar", ".gz", ".tgz", ".tar.gz", ".bz2", ".rar",
 # An individual file inside an archive may be at most (size_limit * this) bytes
 ZIP_OVERSIZED_MULTIPLIER = 10
 
+# ── student / submission identity ────────────────────────────────────────────
+
+STUDENT_ID  = "23727550"   # replace with your actual student ID
+SEEDING_DB  = "sq26"     # submission suffix  →  <student_id>-<seeding_db>.db
+
 # ── identity ──────────────────────────────────────────────────────────────────
 
 USER_AGENT = "QDArchive-Pipeline/1.0 (research crawler; github.com/AnitaKamani/qdarchive-pipeline)"

@@ -3,7 +3,9 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-DB_PATH = "qdarchive.db"
+import config
+
+DB_PATH = f"{config.STUDENT_ID}-{config.SEEDING_DB}.db"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
