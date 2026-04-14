@@ -64,7 +64,10 @@ File download statuses: `SUCCEEDED`, `NOT_ATTEMPTED`, `FAILED_LOGIN_REQUIRED`, `
 
 ## Downloads
 
-Files are saved to:
+Files are saved locally to:
+
 ```
 downloads/<repo_folder>/<project_folder>/<filename>
 ```
+
+The downloaded files referenced in [23727550-sq26.db](https://github.com/AnitaKamani/qdarchive-pipeline/blob/main/23727550-sq26.db) have been uploaded to [Google Drive](https://drive.google.com/drive/folders/1o9fbdV-gSAqRUw8gA0AnbUHjLxd9Vg0U) under the same folder structure.
