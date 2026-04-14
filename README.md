@@ -44,7 +44,7 @@ You will be prompted for:
 
 ## Database
 
-SQLite file: `qdarchive.db` — 5 tables, 1 view:
+SQLite file: `<student_id>-<seeding_db>.db` (configured in `config.py`) — 5 tables, 1 view:
 
 | Table | Description |
 |-------|-------------|
@@ -56,7 +56,7 @@ SQLite file: `qdarchive.db` — 5 tables, 1 view:
 
 | View | Description |
 |------|-------------|
-| `v_files` | Files joined with project URL, repo ID, and size in MB |
+| `v_files` | Files joined with project URL, repo ID, size in MB, and download date |
 
 File download statuses: `SUCCEEDED`, `NOT_ATTEMPTED`, `FAILED_LOGIN_REQUIRED`, `FAILED_TOO_LARGE`, `FAILED_SERVER_UNRESPONSIVE`
 

@@ -67,7 +67,8 @@ SELECT
     f.file_url,
     f.file_name,
     ROUND(f.file_size / 1048576.0, 2)  AS file_size_mb,
-    f.status
+    f.status,
+    p.download_date
 FROM files f
 JOIN projects p ON p.id = f.project_id;
 """
