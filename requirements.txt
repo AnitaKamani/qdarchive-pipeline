@@ -6,3 +6,4 @@ urllib3==2.6.3
 tqdm==4.67.3
 pandas
 openpyxl
+openai>=1.0.0

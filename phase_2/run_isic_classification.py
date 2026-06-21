@@ -146,7 +146,7 @@ def run(
     inputs = _load_inputs(conn, target_type, limit, offset)
     print(f"  {len(inputs):,} inputs loaded.", flush=True)
 
-    method = provider
+    method = f"{provider}:{model}" if provider == "openai" else provider
     already_done: set[int] = set()
     if not overwrite:
         already_done = _already_classified(conn, target_type, method)
@@ -231,7 +231,13 @@ def main() -> None:
     args = parser.parse_args()
 
     import os
-    api_key = os.environ.get("OPENAI_API_KEY") if args.provider == "openai" else None
+    api_key = None
+    if args.provider == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            print("ERROR: OPENAI_API_KEY environment variable is not set.", file=sys.stderr)
+            print("  Set it with:  export OPENAI_API_KEY='sk-...'", file=sys.stderr)
+            sys.exit(1)
 
     print("=" * 64)
     print("ISIC Classification Run")

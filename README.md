@@ -104,7 +104,12 @@ python phase_2/check_isic_classification.py --db 23727550-sq26-combined.db
 
 ```bash
 export OPENAI_API_KEY="..."
-python phase_2/run_isic_classification.py --db 23727550-sq26-combined.db --provider openai --model gpt-4o-mini --limit 20 --overwrite
+python phase_2/run_isic_classification.py \
+  --db 23727550-sq26-combined.db \
+  --provider openai \
+  --model gpt-4o-mini \
+  --limit 20 \
+  --overwrite
 ```
 
 **Full OpenAI project classification:**
