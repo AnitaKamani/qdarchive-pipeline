@@ -4,3 +4,12 @@
 __*
 .env
 downloads
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# SQLite WAL/SHM/journal artifacts (not the .db files themselves)
+*.db-wal
+*.db-shm
+*.db-journal
