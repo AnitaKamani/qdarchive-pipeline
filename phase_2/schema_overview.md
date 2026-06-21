@@ -1,13 +1,56 @@
 # QDArchive Database Schema Overview
 
 **Database:** `23727550-sq26.db`  
-**Generated:** 2026-06-21 15:43:51  
-**Tables:** 5  
+**Generated:** 2026-06-21 16:00:22  
+**Tables:** 10  
 **Views:** 1
 
 ---
 
 ## Tables
+
+### `classification_inputs`
+
+**Row count:** 0
+
+| # | Column | Type | PK | Nullable | Default |
+|---|--------|------|----|----------|---------|
+| 0 | `id` | `INTEGER` | PK1 | nullable | — |
+| 1 | `target_type` | `TEXT` |  | NOT NULL | — |
+| 2 | `target_id` | `INTEGER` |  | NOT NULL | — |
+| 3 | `project_id` | `INTEGER` |  | nullable | — |
+| 4 | `input_text` | `TEXT` |  | NOT NULL | — |
+| 5 | `created_at` | `TEXT` |  | nullable | `CURRENT_TIMESTAMP` |
+
+---
+
+### `file_classifications`
+
+**Row count:** 0
+
+| # | Column | Type | PK | Nullable | Default |
+|---|--------|------|----|----------|---------|
+| 0 | `id` | `INTEGER` | PK1 | nullable | — |
+| 1 | `file_id` | `INTEGER` |  | NOT NULL | — |
+| 2 | `project_id` | `INTEGER` |  | NOT NULL | — |
+| 3 | `primary_class_code` | `TEXT` |  | nullable | — |
+| 4 | `secondary_class_code` | `TEXT` |  | nullable | — |
+| 5 | `tags` | `TEXT` |  | nullable | — |
+| 6 | `confidence` | `REAL` |  | nullable | — |
+| 7 | `method` | `TEXT` |  | nullable | — |
+| 8 | `reason` | `TEXT` |  | nullable | — |
+| 9 | `created_at` | `TEXT` |  | nullable | `CURRENT_TIMESTAMP` |
+
+**Foreign keys:**
+
+| Column | References | On Update | On Delete |
+|--------|------------|-----------|-----------|
+| `secondary_class_code` | `isic_divisions(code)` | NO ACTION | NO ACTION |
+| `primary_class_code` | `isic_divisions(code)` | NO ACTION | NO ACTION |
+| `project_id` | `projects(id)` | NO ACTION | NO ACTION |
+| `file_id` | `files(id)` | NO ACTION | NO ACTION |
+
+---
 
 ### `files`
 
@@ -35,6 +78,20 @@
 - `status IN (
                     'SUCCEEDED','FAILED_SERVER_UNRESPONSIVE',
                     'FAILED_LOGIN_REQUIRED','FAILED_TOO_LARGE','NOT_ATTEMPTED'`
+
+---
+
+### `isic_divisions`
+
+**Row count:** 87
+
+| # | Column | Type | PK | Nullable | Default |
+|---|--------|------|----|----------|---------|
+| 0 | `code` | `TEXT` | PK1 | nullable | — |
+| 1 | `section_code` | `TEXT` |  | nullable | — |
+| 2 | `division` | `INTEGER` |  | nullable | — |
+| 3 | `title` | `TEXT` |  | NOT NULL | — |
+| 4 | `description` | `TEXT` |  | nullable | — |
 
 ---
 
@@ -97,6 +154,32 @@
 
 ---
 
+### `project_classifications`
+
+**Row count:** 0
+
+| # | Column | Type | PK | Nullable | Default |
+|---|--------|------|----|----------|---------|
+| 0 | `id` | `INTEGER` | PK1 | nullable | — |
+| 1 | `project_id` | `INTEGER` |  | NOT NULL | — |
+| 2 | `primary_class_code` | `TEXT` |  | nullable | — |
+| 3 | `secondary_class_code` | `TEXT` |  | nullable | — |
+| 4 | `tags` | `TEXT` |  | nullable | — |
+| 5 | `confidence` | `REAL` |  | nullable | — |
+| 6 | `method` | `TEXT` |  | nullable | — |
+| 7 | `reason` | `TEXT` |  | nullable | — |
+| 8 | `created_at` | `TEXT` |  | nullable | `CURRENT_TIMESTAMP` |
+
+**Foreign keys:**
+
+| Column | References | On Update | On Delete |
+|--------|------------|-----------|-----------|
+| `secondary_class_code` | `isic_divisions(code)` | NO ACTION | NO ACTION |
+| `primary_class_code` | `isic_divisions(code)` | NO ACTION | NO ACTION |
+| `project_id` | `projects(id)` | NO ACTION | NO ACTION |
+
+---
+
 ### `projects`
 
 **Row count:** 2,684
@@ -119,10 +202,22 @@
 | 13 | `download_project_folder` | `TEXT` |  | NOT NULL | — |
 | 14 | `download_version_folder` | `TEXT` |  | nullable | — |
 | 15 | `download_method` | `TEXT` |  | NOT NULL | — |
+| 16 | `project_type` | `TEXT` |  | nullable | — |
 
 **CHECK constraints:**
 
 - `download_method IN ('SCRAPING','API-CALL'`
+
+---
+
+### `sqlite_sequence`
+
+**Row count:** 0
+
+| # | Column | Type | PK | Nullable | Default |
+|---|--------|------|----|----------|---------|
+| 0 | `name` | `—` |  | nullable | — |
+| 1 | `seq` | `—` |  | nullable | — |
 
 ---
 
