@@ -1,0 +1,9 @@
+check,status,detail
+project_type filled for all rows,PASS,"68,267/68,267 rows classified"
+isic_divisions row count,PASS,87 rows (expected 87)
+classification_inputs has PROJECT rows,PASS,"38,032 PROJECT inputs"
+PROJECT target_ids match combined_projects,PASS,0 orphan inputs
+report exists: reports/project_type_summary.csv,PASS,
+report exists: reports/project_type_by_student.csv,PASS,
+report exists: reports/project_type_examples.csv,PASS,
+report exists: reports/merge_report.csv,PASS,
