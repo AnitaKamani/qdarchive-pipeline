@@ -1,0 +1,5 @@
+check,status,detail
+project_classifications has rows,PASS,20 rows
+all primary_class_codes in isic_divisions,PASS,0 invalid codes
+all project_ids in combined_projects,PASS,0 orphan project_ids
+top primary_class_codes (informational),PASS,R86(12); Q85(3); N74(2); N72(2); S90(1)

@@ -71,3 +71,50 @@ downloads/<repo_folder>/<project_folder>/<filename>
 ```
 
 The downloaded files referenced in [23727550-sq26.db](https://github.com/AnitaKamani/qdarchive-pipeline/blob/main/23727550-sq26.db) have been uploaded to [Google Drive](https://drive.google.com/drive/folders/1o9fbdV-gSAqRUw8gA0AnbUHjLxd9Vg0U) under the same folder structure.
+
+## Phase 2: Classification
+
+Phase 2 merges student databases, classifies project types by file extension, builds model-ready input text, and assigns ISIC Rev. 5 division codes to each project.
+
+### Student metadata merge
+
+```bash
+python phase_2/setup_student_metadata.py --in-dir data/student_metadata --combined-db 23727550-sq26-combined.db
+```
+
+### Classification preparation (Milestone 3)
+
+Classifies projects by file extension rules and builds `classification_inputs`:
+
+```bash
+python phase_2/prepare_classification.py --db 23727550-sq26-combined.db
+python phase_2/check_classification_preparation.py --db 23727550-sq26-combined.db
+```
+
+### ISIC classification (Milestone 4)
+
+**Dry-run test (no API key required):**
+
+```bash
+python phase_2/run_isic_classification.py --db 23727550-sq26-combined.db --provider local-dry-run --limit 20 --overwrite
+python phase_2/check_isic_classification.py --db 23727550-sq26-combined.db
+```
+
+**OpenAI test (20 projects):**
+
+```bash
+export OPENAI_API_KEY="..."
+python phase_2/run_isic_classification.py --db 23727550-sq26-combined.db --provider openai --model gpt-4o-mini --limit 20 --overwrite
+```
+
+**Full OpenAI project classification:**
+
+```bash
+python phase_2/run_isic_classification.py --db 23727550-sq26-combined.db --provider openai --model gpt-4o-mini
+```
+
+**Validate results:**
+
+```bash
+python phase_2/check_isic_classification.py --db 23727550-sq26-combined.db
+```
