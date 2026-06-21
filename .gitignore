@@ -13,3 +13,7 @@ __pycache__/
 *.db-wal
 *.db-shm
 *.db-journal
+
+# Downloaded student databases and combined output (not tracked)
+data/student_metadata/
+*-combined.db
