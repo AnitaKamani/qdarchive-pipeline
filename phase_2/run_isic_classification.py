@@ -33,6 +33,8 @@ _here = Path(__file__).parent
 if str(_here) not in sys.path:
     sys.path.insert(0, str(_here))
 
+from tqdm import tqdm
+
 from model_isic_classifier import classify, Result
 
 DB_DEFAULT = "23727550-sq26-combined.db"
@@ -152,8 +154,10 @@ def run(
     counters = {"processed": 0, "inserted": 0, "errors": 0}
     error_rows: list[dict] = []
 
-    for i, row in enumerate(inputs):
+    bar = tqdm(inputs, desc="Classifying", unit="proj", dynamic_ncols=True)
+    for row in bar:
         project_id = row["project_id"] or row["target_id"]
+        bar.set_postfix(inserted=counters["inserted"], errors=counters["errors"], pid=project_id, refresh=False)
 
         text = row["input_text"][:max_input_chars]
 
@@ -170,6 +174,7 @@ def run(
         is_error = result.get("primary_class_code") is None
         if is_error:
             if result.get("fatal"):
+                bar.close()
                 conn.commit()
                 conn.close()
                 print(
@@ -192,14 +197,10 @@ def run(
             counters["inserted"] += 1
 
         counters["processed"] += 1
+        bar.set_postfix(inserted=counters["inserted"], errors=counters["errors"], pid=project_id)
 
         if counters["processed"] % PROGRESS_INTERVAL == 0:
             conn.commit()
-            print(
-                f"  [{counters['processed']:,}/{len(inputs):,}] "
-                f"inserted={counters['inserted']:,} errors={counters['errors']:,}",
-                flush=True,
-            )
 
         if sleep_secs > 0:
             time.sleep(sleep_secs)
