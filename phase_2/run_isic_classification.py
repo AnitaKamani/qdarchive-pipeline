@@ -53,14 +53,23 @@ def _load_inputs(
     target_type: str,
     limit: int | None,
     offset: int | None,
+    exclude_method: str | None = None,
 ) -> list[dict]:
+    params: list = [target_type]
     sql = (
         "SELECT ci.id, ci.target_id, ci.project_id, ci.input_text "
         "FROM classification_inputs ci "
         "WHERE ci.target_type = ?"
     )
-    params: list = [target_type]
-
+    if exclude_method is not None:
+        sql += (
+            " AND NOT EXISTS ("
+            "SELECT 1 FROM project_classifications pc "
+            "WHERE pc.project_id = COALESCE(ci.project_id, ci.target_id) "
+            "AND pc.method = ?)"
+        )
+        params.append(exclude_method)
+    sql += " ORDER BY ci.id"
     if offset:
         sql += " LIMIT -1 OFFSET ?"
         params.append(offset)
@@ -72,15 +81,6 @@ def _load_inputs(
 
     rows = conn.execute(sql, params).fetchall()
     return [{"id": r[0], "target_id": r[1], "project_id": r[2], "input_text": r[3]} for r in rows]
-
-
-def _already_classified(conn: sqlite3.Connection, target_type: str, method: str) -> set[int]:
-    if target_type == "PROJECT":
-        rows = conn.execute(
-            "SELECT project_id FROM project_classifications WHERE method = ?", (method,)
-        ).fetchall()
-        return {r[0] for r in rows}
-    return set()
 
 
 def _upsert_project_classification(
@@ -142,25 +142,18 @@ def run(
     divisions, valid_codes = _load_divisions(conn)
     print(f"  {len(valid_codes)} divisions loaded.", flush=True)
 
-    print(f"Loading {target_type} classification inputs...", flush=True)
-    inputs = _load_inputs(conn, target_type, limit, offset)
-    print(f"  {len(inputs):,} inputs loaded.", flush=True)
-
     method = f"{provider}:{model}" if provider == "openai" else provider
-    already_done: set[int] = set()
-    if not overwrite:
-        already_done = _already_classified(conn, target_type, method)
-        print(f"  {len(already_done):,} already classified (will skip).", flush=True)
 
-    counters = {"processed": 0, "inserted": 0, "skipped_existing": 0, "errors": 0}
+    print(f"Loading {target_type} classification inputs...", flush=True)
+    exclude = None if overwrite else method
+    inputs = _load_inputs(conn, target_type, limit, offset, exclude_method=exclude)
+    print(f"  {len(inputs):,} inputs loaded (unclassified for method '{method}').", flush=True)
+
+    counters = {"processed": 0, "inserted": 0, "errors": 0}
     error_rows: list[dict] = []
 
     for i, row in enumerate(inputs):
         project_id = row["project_id"] or row["target_id"]
-
-        if project_id in already_done:
-            counters["skipped_existing"] += 1
-            continue
 
         text = row["input_text"][:max_input_chars]
 
