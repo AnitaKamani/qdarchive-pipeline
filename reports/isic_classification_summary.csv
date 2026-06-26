@@ -1,6 +1,45 @@
 method,primary_class_code,class_title,count
-local-dry-run,R86,Human health activities,12
-local-dry-run,Q85,Education,3
-local-dry-run,N74,"Other professional, scientific and technical activities",2
-local-dry-run,N72,Scientific research and development,2
-local-dry-run,S90,Arts creation and performing arts activities,1
+openai:gpt-4o-mini,Q85,Education,525
+openai:gpt-4o-mini,N72,Scientific research and development,517
+openai:gpt-4o-mini,R86,Human health activities,422
+openai:gpt-4o-mini,P84,Public administration and defence; compulsory social security,161
+openai:gpt-4o-mini,A01,"Crop and animal production, hunting and related service activities",94
+openai:gpt-4o-mini,O78,Employment activities,85
+openai:gpt-4o-mini,R88,Social work activities without accommodation,58
+openai:gpt-4o-mini,S91,"Library, archives, museum and other cultural activities",44
+openai:gpt-4o-mini,A02,Forestry and logging,33
+openai:gpt-4o-mini,A03,Fishing and aquaculture,31
+openai:gpt-4o-mini,T94,Activities of membership organizations,18
+openai:gpt-4o-mini,N69,Legal and accounting activities,12
+openai:gpt-4o-mini,J60,"Programming, broadcasting, news agency and other content distribution activities",9
+openai:gpt-4o-mini,S90,Arts creation and performing arts activities,8
+openai:gpt-4o-mini,J58,Publishing activities,8
+openai:gpt-4o-mini,K63,"Computing infrastructure, data processing, hosting, and other information service activities",7
+openai:gpt-4o-mini,E36,"Water collection, treatment and supply",7
+openai:gpt-4o-mini,O79,"Travel agency, tour operator, and other travel related activities",6
+openai:gpt-4o-mini,M68,Real estate activities,6
+openai:gpt-4o-mini,L64,"Financial service activities, except insurance and pension funding",6
+openai:gpt-4o-mini,K61,Telecommunications,6
+openai:gpt-4o-mini,K62,"Computer programming, consultancy and related activities",5
+openai:gpt-4o-mini,G47,Retail trade,5
+openai:gpt-4o-mini,C10,Manufacture of food products,5
+openai:gpt-4o-mini,S93,Sports activities and amusement and recreation activities,4
+openai:gpt-4o-mini,N73,"Activities of advertising, market research and public relations",4
+openai:gpt-4o-mini,T96,Personal service activities,3
+openai:gpt-4o-mini,R87,Residential care activities,3
+openai:gpt-4o-mini,H49,Land transport and transport via pipelines,3
+openai:gpt-4o-mini,J59,"Motion picture, video and television programme production, sound recording and music publishing activities",2
+openai:gpt-4o-mini,F42,Civil engineering,2
+openai:gpt-4o-mini,E38,"Waste collection, treatment and disposal, and recovery activities",2
+openai:gpt-4o-mini,C14,Manufacture of wearing apparel,2
+openai:gpt-4o-mini,O82,"Office administrative, office support and other business support activities",1
+openai:gpt-4o-mini,O81,Services to buildings and landscape activities,1
+openai:gpt-4o-mini,I56,Food and beverage service activities,1
+openai:gpt-4o-mini,I55,Accommodation,1
+openai:gpt-4o-mini,G46,Wholesale trade,1
+openai:gpt-4o-mini,E37,Sewerage,1
+openai:gpt-4o-mini,D35,"Electricity, gas, steam and air conditioning supply",1
+openai:gpt-4o-mini,C31,Manufacture of furniture,1
+openai:gpt-4o-mini,C20,Manufacture of chemicals and chemical products,1
+openai:gpt-4o-mini,B08,Other mining and quarrying,1
+openai:gpt-4o-mini,B06,Extraction of crude petroleum and natural gas,1

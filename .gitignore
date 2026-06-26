@@ -1,8 +1,11 @@
 .claude
-.venv
+.venv/
 .DS*
 __*
 .env
+.env.*
+*.key
+CLAUDE.md
 downloads
 
 # Python cache
@@ -16,4 +19,4 @@ __pycache__/
 
 # Downloaded student databases and combined output (not tracked)
 data/student_metadata/
-*-combined.db
+*-combined*.db

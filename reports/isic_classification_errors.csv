@@ -1,0 +1,15 @@
+input_id,project_id,reason,raw_model_output
+696,853,validation failed: primary_class_code 'O88' not in isic_divisions,"{
+  ""primary_class_code"": ""O88"",
+  ""secondary_class_code"": null,
+  ""tags"": [""youth work"", ""social exclusion"", ""employment programmes""],
+  ""confidence"": 0.92,
+  ""reason"": ""The project focuses on social work activities related to youth, including interviews with youth workers and volunteers.""
+}"
+1921,3465,validation failed: primary_class_code 'O88' not in isic_divisions,"{
+  ""primary_class_code"": ""O88"",
+  ""secondary_class_code"": null,
+  ""tags"": [""osallisuus"", ""työttömyys"", ""syrjäytyminen"", ""yhteisöllisyys""],
+  ""confidence"": 0.92,
+  ""reason"": ""The project focuses on social work activities aimed at improving the inclusion and well-being of unemployed individuals, which aligns with social work activities without accommodation.""
+}"
