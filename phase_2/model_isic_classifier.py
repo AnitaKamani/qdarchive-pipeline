@@ -194,6 +194,11 @@ def _validate_result(result: dict, valid_codes: set[str]) -> list[str]:
     return errors
 
 
+def _is_fatal_api_error(msg: str) -> bool:
+    low = msg.lower()
+    return "401" in msg or "authentication" in low or "incorrect api key" in low or "invalid_api_key" in low
+
+
 def classify_openai(
     input_text: str,
     valid_codes: set[str],
@@ -205,14 +210,15 @@ def classify_openai(
     try:
         import openai  # type: ignore
     except ImportError:
-        return _make_error("openai package not installed; run: pip install openai")
+        return {**_make_error("openai package not installed; run: pip install openai"), "fatal": True}
 
     key = api_key or os.environ.get("OPENAI_API_KEY", "")
     if not key:
-        return _make_error("OPENAI_API_KEY not set")
+        return {**_make_error("OPENAI_API_KEY not set"), "fatal": True}
 
     client = openai.OpenAI(api_key=key)
     user_prompt = _build_user_prompt(input_text, divisions, max_input_chars)
+    raw = ""
 
     try:
         response = client.chat.completions.create(
@@ -226,17 +232,47 @@ def classify_openai(
             response_format={"type": "json_object"},
         )
     except Exception as exc:
-        return _make_error(f"API error: {str(exc)[:200]}")
+        msg = str(exc)
+        fatal = _is_fatal_api_error(msg)
+        return {**_make_error(f"API error: {msg[:400]}"), "raw_model_output": "", "fatal": fatal}
 
     raw = response.choices[0].message.content or ""
+
+    # Strip markdown code fences and extract JSON object if surrounded by extra text.
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned.strip())
+    m = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if m:
+        cleaned = m.group(0)
+
     try:
-        parsed = json.loads(raw)
+        parsed = json.loads(cleaned)
     except json.JSONDecodeError as exc:
-        return _make_error(f"JSON parse error: {exc} | raw={raw[:100]}")
+        return {**_make_error(f"JSON parse error: {exc}"), "raw_model_output": raw[:1000]}
+
+    # Coerce secondary_class_code: "" or "null" -> None
+    sec = parsed.get("secondary_class_code")
+    if sec == "" or sec == "null":
+        parsed["secondary_class_code"] = None
+
+    # Coerce confidence: string -> float
+    conf = parsed.get("confidence")
+    if isinstance(conf, str):
+        try:
+            parsed["confidence"] = float(conf)
+        except (ValueError, TypeError):
+            parsed["confidence"] = 0.0
+
+    # Coerce tags: string -> list
+    tags_raw = parsed.get("tags", [])
+    if isinstance(tags_raw, str):
+        parsed["tags"] = [t.strip() for t in tags_raw.split(",") if t.strip()]
 
     errors = _validate_result(parsed, valid_codes)
     if errors:
-        return _make_error(f"validation failed: {'; '.join(errors)}")
+        return {**_make_error(f"validation failed: {'; '.join(errors)}"), "raw_model_output": raw[:1000]}
 
     tags = parsed.get("tags", [])
     if not isinstance(tags, list):

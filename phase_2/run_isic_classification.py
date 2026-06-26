@@ -176,11 +176,21 @@ def run(
 
         is_error = result.get("primary_class_code") is None
         if is_error:
+            if result.get("fatal"):
+                conn.commit()
+                conn.close()
+                print(
+                    f"\nFATAL: {result.get('reason', '')}",
+                    file=sys.stderr,
+                )
+                print("  Aborting — no rows will be written for this error.", file=sys.stderr)
+                sys.exit(2)
             counters["errors"] += 1
             error_rows.append({
                 "input_id": row["id"],
                 "project_id": project_id,
                 "reason": result.get("reason", ""),
+                "raw_model_output": (result.get("raw_model_output") or "")[:1000],
             })
             result_to_store = {**result, "primary_class_code": None}
             _upsert_project_classification(conn, project_id, result_to_store, "model_error")
@@ -208,7 +218,7 @@ def run(
     if error_rows:
         Path("reports").mkdir(parents=True, exist_ok=True)
         with open(ERRORS_REPORT, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["input_id", "project_id", "reason"])
+            w = csv.DictWriter(f, fieldnames=["input_id", "project_id", "reason", "raw_model_output"])
             w.writeheader()
             w.writerows(error_rows)
         print(f"  Errors written to {ERRORS_REPORT}", flush=True)
