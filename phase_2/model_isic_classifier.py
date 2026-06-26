@@ -114,19 +114,52 @@ def classify_local_dry_run(input_text: str, valid_codes: set[str]) -> Result:
 # openai provider
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = (
-    "You are an expert research classifier. Given a description of a qualitative research project, "
-    "classify it into the most appropriate ISIC Rev. 5 division. "
-    "You must respond only with valid JSON matching the schema below — no markdown, no explanation outside the JSON."
-)
+_SYSTEM_PROMPT = """\
+You are an expert research classifier. Given a description of a qualitative research project, \
+classify it into the most appropriate ISIC Rev. 5 division from the provided list.
+You must respond only with valid JSON matching the schema below — no markdown, no explanation outside the JSON.
+
+Classification rules:
+- Choose the ISIC division that best matches the main substantive domain of the project, not a superficial keyword.
+- Do not choose a class only because a single keyword appears.
+- Q85 Education: use when the project is about teaching, students, schools, universities, curriculum, \
+learning, training, educational practice, or student feedback. Do NOT use Q85 for lab science merely \
+because the data was collected at a university.
+- P84 Public administration and defence: use ONLY for government administration, public policy administration, \
+defence, or compulsory social security. Do NOT use P84 for university teaching, student datasets, or \
+education-sector research.
+- R86 Human health activities: use for medical, clinical, patient, disease, diagnosis, treatment, \
+healthcare, hospital, therapy, or health-service projects.
+- N72 Scientific research and development: use when the project is primarily academic or scientific research \
+and no clearer economic sector dominates (e.g. lab science, biomedical research, general R&D).
+- M68 Real estate activities: use ONLY for real estate, property markets, rental, land/property transactions, \
+or real-estate services. Do NOT use M68 for general consumer purchases, data management plans, or unrelated topics.
+- A01/A02/A03 Agriculture/forestry/fishing: use ONLY when agriculture, forestry, fishing, or aquaculture \
+is the main sector — not merely because plants, animals, or ecology appear.
+- If the reason you would give mentions a different class than the code you selected, correct the code before returning JSON.
+
+Confidence calibration:
+- 0.90–1.00: the class is unambiguous and obvious.
+- 0.70–0.89: likely correct but some ambiguity exists.
+- 0.50–0.69: uncertain between two plausible classes.
+- Do not return 0.95 as a default; calibrate genuinely.
+
+Examples:
+- "Survey on student expectations for faculty and peer support in engineering education" → Q85, confidence ~0.95
+- "Hospital patient interviews about chronic pain management" → R86, confidence ~0.93
+- "General ecological research dataset on soil microbiology" → N72, confidence ~0.80
+- "Government policy implementation and public administration reform" → P84, confidence ~0.90
+- "Real estate market transactions and rental price data" → M68, confidence ~0.92
+- "Why did I buy that? A study of regretted consumer appliance purchases" → G47, confidence ~0.75\
+"""
 
 _OUTPUT_SCHEMA = """\
 {
-  "primary_class_code": "<ISIC division code, e.g. P85>",
+  "primary_class_code": "<ISIC division code from the allowed list>",
   "secondary_class_code": "<ISIC division code or null>",
   "tags": ["<keyword1>", "<keyword2>"],
   "confidence": <float 0.0–1.0>,
-  "reason": "<one sentence>"
+  "reason": "<one sentence explaining the classification>"
 }"""
 
 
