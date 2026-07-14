@@ -4,6 +4,11 @@ Run model-based ISIC Rev. 5 classification on PROJECT inputs.
 Reads classification_inputs (target_type='PROJECT'), classifies each via the
 chosen provider, and writes results to project_classifications.
 
+The openai provider runs requests concurrently (bounded by --concurrency)
+using asyncio and the OpenAI async client; local-dry-run runs sequentially
+since it makes no network calls. Database writes always happen from a single
+coroutine in the main thread, never from concurrent tasks.
+
 Usage:
     python phase_2/run_isic_classification.py [options]
 
@@ -15,13 +20,16 @@ Options:
     --limit         N             process at most N rows
     --offset        N             skip first N rows
     --overwrite                   re-classify already-classified projects
-    --sleep         SECS          pause between API calls (default: 0)
+    --sleep         SECS          pause between API calls (local-dry-run / sequential only)
     --max-input-chars N           truncate input_text to N chars (default: 6000)
+    --concurrency   N             concurrent in-flight OpenAI requests (default: 5)
+    --max-retries   N             max retries per request on transient errors (default: 5)
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import json
 import sqlite3
@@ -35,12 +43,14 @@ if str(_here) not in sys.path:
 
 from tqdm import tqdm
 
-from model_isic_classifier import classify, Result
+from model_isic_classifier import classify, classify_openai_async, Result
 
 DB_DEFAULT = "23727550-sq26-combined.db"
 SUMMARY_REPORT = "reports/isic_classification_summary.csv"
 ERRORS_REPORT = "reports/isic_classification_errors.csv"
 PROGRESS_INTERVAL = 50
+DEFAULT_CONCURRENCY = 5
+DEFAULT_MAX_RETRIES = 5
 
 
 def _load_divisions(conn: sqlite3.Connection) -> tuple[list[dict], set[str]]:
@@ -125,33 +135,28 @@ def _write_summary(conn: sqlite3.Connection, method: str) -> None:
             w.writerow([method, r[0], r[1] or "", r[2]])
 
 
-def run(
-    db_path: str,
+def _write_errors_report(error_rows: list[dict]) -> None:
+    Path("reports").mkdir(parents=True, exist_ok=True)
+    with open(ERRORS_REPORT, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["input_id", "project_id", "reason", "raw_model_output"])
+        w.writeheader()
+        w.writerows(error_rows)
+    print(f"  Errors written to {ERRORS_REPORT}", flush=True)
+
+
+def _run_sequential(
+    conn: sqlite3.Connection,
+    inputs: list[dict],
     provider: str,
     model: str,
-    target_type: str,
-    limit: int | None,
-    offset: int | None,
-    overwrite: bool,
-    sleep_secs: float,
+    method: str,
     max_input_chars: int,
-    api_key: str | None = None,
+    api_key: str | None,
+    sleep_secs: float,
+    divisions: list[dict],
+    valid_codes: set[str],
 ) -> dict[str, int]:
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode = WAL")
-
-    print("Loading ISIC divisions...", flush=True)
-    divisions, valid_codes = _load_divisions(conn)
-    print(f"  {len(valid_codes)} divisions loaded.", flush=True)
-
-    method = f"{provider}:{model}" if provider == "openai" else provider
-
-    print(f"Loading {target_type} classification inputs...", flush=True)
-    exclude = None if overwrite else method
-    inputs = _load_inputs(conn, target_type, limit, offset, exclude_method=exclude)
-    print(f"  {len(inputs):,} inputs loaded (unclassified for method '{method}').", flush=True)
-
-    counters = {"processed": 0, "inserted": 0, "errors": 0}
+    counters = {"processed": 0, "inserted": 0, "errors": 0, "retries": 0}
     error_rows: list[dict] = []
 
     bar = tqdm(inputs, desc="Classifying", unit="proj", dynamic_ncols=True)
@@ -176,11 +181,7 @@ def run(
             if result.get("fatal"):
                 bar.close()
                 conn.commit()
-                conn.close()
-                print(
-                    f"\nFATAL: {result.get('reason', '')}",
-                    file=sys.stderr,
-                )
+                print(f"\nFATAL: {result.get('reason', '')}", file=sys.stderr)
                 print("  Aborting — no rows will be written for this error.", file=sys.stderr)
                 sys.exit(2)
             counters["errors"] += 1
@@ -206,17 +207,178 @@ def run(
             time.sleep(sleep_secs)
 
     conn.commit()
-
-    _write_summary(conn, method)
+    bar.close()
 
     if error_rows:
-        Path("reports").mkdir(parents=True, exist_ok=True)
-        with open(ERRORS_REPORT, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["input_id", "project_id", "reason", "raw_model_output"])
-            w.writeheader()
-            w.writerows(error_rows)
-        print(f"  Errors written to {ERRORS_REPORT}", flush=True)
+        _write_errors_report(error_rows)
 
+    return counters
+
+
+def _run_openai_concurrent(
+    conn: sqlite3.Connection,
+    inputs: list[dict],
+    divisions: list[dict],
+    valid_codes: set[str],
+    model: str,
+    method: str,
+    max_input_chars: int,
+    api_key: str | None,
+    concurrency: int,
+    max_retries: int,
+) -> dict[str, int]:
+    try:
+        import openai  # type: ignore
+    except ImportError:
+        print("ERROR: openai package not installed; run: pip install openai", file=sys.stderr)
+        sys.exit(1)
+
+    counters = {"processed": 0, "inserted": 0, "errors": 0, "retries": 0}
+    error_rows: list[dict] = []
+    abort: dict[str, str | None] = {"reason": None}
+
+    async def _drive() -> None:
+        # max_retries=0 on the client: our own retry loop in classify_openai_async
+        # owns backoff/jitter, so the SDK's built-in retries would double up otherwise.
+        client = openai.AsyncOpenAI(api_key=api_key, max_retries=0)
+        sem = asyncio.Semaphore(concurrency)
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def worker(row: dict) -> None:
+            if abort["reason"] is not None:
+                await queue.put((row, None))
+                return
+            async with sem:
+                if abort["reason"] is not None:
+                    await queue.put((row, None))
+                    return
+                text = row["input_text"][:max_input_chars]
+                result = await classify_openai_async(
+                    text,
+                    valid_codes,
+                    divisions,
+                    client=client,
+                    model=model,
+                    max_input_chars=max_input_chars,
+                    max_retries=max_retries,
+                )
+                await queue.put((row, result))
+
+        worker_tasks = [asyncio.create_task(worker(row)) for row in inputs]
+
+        bar = tqdm(total=len(inputs), desc="Classifying", unit="proj", dynamic_ncols=True)
+        try:
+            completed = 0
+            while completed < len(inputs):
+                row, result = await queue.get()
+                completed += 1
+
+                if result is None:
+                    # Skipped: an abort was already in progress when this task started.
+                    bar.update(1)
+                    continue
+
+                if result.get("fatal"):
+                    if abort["reason"] is None:
+                        abort["reason"] = result.get("reason", "")
+                    bar.update(1)
+                    continue
+
+                project_id = row["project_id"] or row["target_id"]
+                is_error = result.get("primary_class_code") is None
+                if is_error:
+                    counters["errors"] += 1
+                    error_rows.append({
+                        "input_id": row["id"],
+                        "project_id": project_id,
+                        "reason": result.get("reason", ""),
+                        "raw_model_output": (result.get("raw_model_output") or "")[:1000],
+                    })
+                    result_to_store = {**result, "primary_class_code": None}
+                    _upsert_project_classification(conn, project_id, result_to_store, "model_error")
+                else:
+                    _upsert_project_classification(conn, project_id, result, method)
+                    counters["inserted"] += 1
+
+                counters["processed"] += 1
+                counters["retries"] += result.get("retries", 0)
+                bar.set_postfix(
+                    inserted=counters["inserted"],
+                    errors=counters["errors"],
+                    retries=counters["retries"],
+                    refresh=False,
+                )
+                bar.update(1)
+
+                if counters["processed"] % PROGRESS_INTERVAL == 0:
+                    conn.commit()
+        finally:
+            conn.commit()
+            bar.close()
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
+            await client.close()
+
+        if abort["reason"] is not None:
+            print(f"\nFATAL: {abort['reason']}", file=sys.stderr)
+            print("  Aborting — remaining rows were not processed.", file=sys.stderr)
+            sys.exit(2)
+
+    try:
+        asyncio.run(_drive())
+    except KeyboardInterrupt:
+        conn.commit()
+        print(
+            "\nInterrupted — already-committed rows are safe. Re-run the same command to resume.",
+            file=sys.stderr,
+        )
+        sys.exit(130)
+
+    if error_rows:
+        _write_errors_report(error_rows)
+
+    return counters
+
+
+def run(
+    db_path: str,
+    provider: str,
+    model: str,
+    target_type: str,
+    limit: int | None,
+    offset: int | None,
+    overwrite: bool,
+    sleep_secs: float,
+    max_input_chars: int,
+    api_key: str | None = None,
+    concurrency: int = DEFAULT_CONCURRENCY,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+) -> dict[str, int]:
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode = WAL")
+
+    print("Loading ISIC divisions...", flush=True)
+    divisions, valid_codes = _load_divisions(conn)
+    print(f"  {len(valid_codes)} divisions loaded.", flush=True)
+
+    method = f"{provider}:{model}" if provider == "openai" else provider
+
+    print(f"Loading {target_type} classification inputs...", flush=True)
+    exclude = None if overwrite else method
+    inputs = _load_inputs(conn, target_type, limit, offset, exclude_method=exclude)
+    print(f"  {len(inputs):,} inputs loaded (unclassified for method '{method}').", flush=True)
+
+    if provider == "openai":
+        counters = _run_openai_concurrent(
+            conn, inputs, divisions, valid_codes, model, method,
+            max_input_chars, api_key, concurrency, max_retries,
+        )
+    else:
+        counters = _run_sequential(
+            conn, inputs, provider, model, method, max_input_chars, api_key, sleep_secs,
+            divisions, valid_codes,
+        )
+
+    _write_summary(conn, method)
     conn.close()
     return counters
 
@@ -232,6 +394,14 @@ def main() -> None:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--sleep", type=float, default=0.0)
     parser.add_argument("--max-input-chars", type=int, default=6000)
+    parser.add_argument(
+        "--concurrency", type=int, default=DEFAULT_CONCURRENCY,
+        help="concurrent in-flight OpenAI requests (default: 5)",
+    )
+    parser.add_argument(
+        "--max-retries", type=int, default=DEFAULT_MAX_RETRIES,
+        help="max retries per request on transient errors: 429/500/502/503/504/timeouts (default: 5)",
+    )
     args = parser.parse_args()
 
     import os
@@ -246,12 +416,14 @@ def main() -> None:
     print("=" * 64)
     print("ISIC Classification Run")
     print("=" * 64)
-    print(f"  provider  : {args.provider}")
+    print(f"  provider    : {args.provider}")
     if args.provider == "openai":
-        print(f"  model     : {args.model}")
-    print(f"  db        : {args.db}")
-    print(f"  limit     : {args.limit or 'all'}")
-    print(f"  overwrite : {args.overwrite}")
+        print(f"  model       : {args.model}")
+        print(f"  concurrency : {args.concurrency}")
+        print(f"  max_retries : {args.max_retries}")
+    print(f"  db          : {args.db}")
+    print(f"  limit       : {args.limit or 'all'}")
+    print(f"  overwrite   : {args.overwrite}")
     print()
 
     counters = run(
@@ -265,6 +437,8 @@ def main() -> None:
         sleep_secs=args.sleep,
         max_input_chars=args.max_input_chars,
         api_key=api_key,
+        concurrency=args.concurrency,
+        max_retries=args.max_retries,
     )
 
     print()

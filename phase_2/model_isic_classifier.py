@@ -17,8 +17,10 @@ Both return a Result dict:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import random
 import re
 from typing import Any
 
@@ -199,45 +201,8 @@ def _is_fatal_api_error(msg: str) -> bool:
     return "401" in msg or "authentication" in low or "incorrect api key" in low or "invalid_api_key" in low
 
 
-def classify_openai(
-    input_text: str,
-    valid_codes: set[str],
-    divisions: list[dict],
-    model: str = "gpt-4o-mini",
-    api_key: str | None = None,
-    max_input_chars: int = 6000,
-) -> Result:
-    try:
-        import openai  # type: ignore
-    except ImportError:
-        return {**_make_error("openai package not installed; run: pip install openai"), "fatal": True}
-
-    key = api_key or os.environ.get("OPENAI_API_KEY", "")
-    if not key:
-        return {**_make_error("OPENAI_API_KEY not set"), "fatal": True}
-
-    client = openai.OpenAI(api_key=key)
-    user_prompt = _build_user_prompt(input_text, divisions, max_input_chars)
-    raw = ""
-
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.0,
-            max_tokens=300,
-            response_format={"type": "json_object"},
-        )
-    except Exception as exc:
-        msg = str(exc)
-        fatal = _is_fatal_api_error(msg)
-        return {**_make_error(f"API error: {msg[:400]}"), "raw_model_output": "", "fatal": fatal}
-
-    raw = response.choices[0].message.content or ""
-
+def _parse_model_response(raw: str, valid_codes: set[str]) -> Result:
+    """Parse and validate a raw chat-completion string into a Result dict."""
     # Strip markdown code fences and extract JSON object if surrounded by extra text.
     cleaned = raw.strip()
     if cleaned.startswith("```"):
@@ -285,6 +250,124 @@ def classify_openai(
         "confidence": float(parsed.get("confidence", 0.0)),
         "reason": str(parsed.get("reason", ""))[:500],
     }
+
+
+def _chat_messages(input_text: str, divisions: list[dict], max_input_chars: int) -> list[dict]:
+    return [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": _build_user_prompt(input_text, divisions, max_input_chars)},
+    ]
+
+
+def classify_openai(
+    input_text: str,
+    valid_codes: set[str],
+    divisions: list[dict],
+    model: str = "gpt-4o-mini",
+    api_key: str | None = None,
+    max_input_chars: int = 6000,
+) -> Result:
+    try:
+        import openai  # type: ignore
+    except ImportError:
+        return {**_make_error("openai package not installed; run: pip install openai"), "fatal": True}
+
+    key = api_key or os.environ.get("OPENAI_API_KEY", "")
+    if not key:
+        return {**_make_error("OPENAI_API_KEY not set"), "fatal": True}
+
+    client = openai.OpenAI(api_key=key)
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=_chat_messages(input_text, divisions, max_input_chars),
+            temperature=0.0,
+            max_tokens=300,
+            response_format={"type": "json_object"},
+        )
+    except Exception as exc:
+        msg = str(exc)
+        fatal = _is_fatal_api_error(msg)
+        return {**_make_error(f"API error: {msg[:400]}"), "raw_model_output": "", "fatal": fatal}
+
+    raw = response.choices[0].message.content or ""
+    return _parse_model_response(raw, valid_codes)
+
+
+# ---------------------------------------------------------------------------
+# openai provider — async, with retry/backoff for transient errors
+# ---------------------------------------------------------------------------
+
+# Transient errors worth retrying: rate limits, 5xx server errors (the SDK
+# raises InternalServerError for 500/502/503/504), timeouts, and
+# connection-level failures. Authentication (401) and other client errors
+# (4xx, bad request, invalid JSON, etc.) are not retried.
+def _is_retryable_exception(exc: Exception) -> bool:
+    import openai  # type: ignore
+    return isinstance(exc, (
+        openai.RateLimitError,
+        openai.InternalServerError,
+        openai.APIConnectionError,
+        openai.APITimeoutError,
+    ))
+
+
+def _is_auth_exception(exc: Exception) -> bool:
+    import openai  # type: ignore
+    return isinstance(exc, openai.AuthenticationError)
+
+
+async def classify_openai_async(
+    input_text: str,
+    valid_codes: set[str],
+    divisions: list[dict],
+    client: Any,
+    model: str = "gpt-4o-mini",
+    max_input_chars: int = 6000,
+    max_retries: int = 5,
+) -> Result:
+    """Async equivalent of classify_openai, with exponential-backoff retry
+    on transient errors. `client` must be an openai.AsyncOpenAI instance,
+    created once and shared across concurrent calls for connection reuse.
+    """
+    messages = _chat_messages(input_text, divisions, max_input_chars)
+    retries = 0
+
+    while True:
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.0,
+                max_tokens=300,
+                response_format={"type": "json_object"},
+            )
+        except Exception as exc:
+            if _is_auth_exception(exc):
+                return {
+                    **_make_error(f"API error: {str(exc)[:400]}"),
+                    "raw_model_output": "",
+                    "fatal": True,
+                    "retries": retries,
+                }
+            if _is_retryable_exception(exc) and retries < max_retries:
+                delay = min(30.0, (2 ** retries)) + random.uniform(0, 1)
+                retries += 1
+                await asyncio.sleep(delay)
+                continue
+            msg = str(exc)
+            return {
+                **_make_error(f"API error after {retries} retries: {msg[:400]}"),
+                "raw_model_output": "",
+                "fatal": _is_fatal_api_error(msg),
+                "retries": retries,
+            }
+
+        raw = response.choices[0].message.content or ""
+        result = _parse_model_response(raw, valid_codes)
+        result["retries"] = retries
+        return result
 
 
 # ---------------------------------------------------------------------------
