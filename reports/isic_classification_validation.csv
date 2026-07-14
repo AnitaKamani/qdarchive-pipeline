@@ -1,5 +1,8 @@
 check,status,detail
-project_classifications has rows,PASS,"38,032 rows"
+project_classifications has rows (method=openai:gpt-4o-mini),PASS,"2,114 rows"
 all primary_class_codes in isic_divisions,PASS,0 invalid codes
 all project_ids in combined_projects,PASS,0 orphan project_ids
-top primary_class_codes (informational),PASS,N74(9935); N72(6361); Q85(5760); R86(3021); O78(2176)
+no NULL primary_class_code for method=openai:gpt-4o-mini,PASS,0 NULL rows
+"model_error rows (informational, not successful)",PASS,105 rows
+remaining unclassified PROJECT inputs (method=openai:gpt-4o-mini),PASS,"35,918 remaining"
+top primary_class_codes (informational),PASS,Q85(525); N72(517); R86(422); P84(161); A01(94)
