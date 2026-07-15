@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import re
 import sys
 import tempfile
 import textwrap
@@ -80,6 +81,21 @@ STUDENT_ID = "23727550"
 AUTHOR = "Fatemeh Kamani"
 SUPERVISOR = "Prof. Riehle"
 REPORT_DATE = "July 2026"
+
+# Table-of-contents layout: readable body-text size (never a tiny footnote
+# size) and a comfortable leading, both in points so the row budget below
+# scales correctly regardless of page geometry.
+TOC_FONT_SIZE = 11
+TOC_ROW_LEADING_PTS = 22
+TOC_HEADING_RESERVE_IN = 0.75  # space reserved for the page's own heading + gap before the first row
+
+
+def _repo_anchor(repo_id: int) -> str:
+    """Stable named-destination/bookmark anchor for a repository section.
+    repository_id is always a plain integer column, but this sanitizes
+    defensively so the anchor is never built from anything containing
+    characters a PDF name/destination can't safely carry."""
+    return "repository_" + re.sub(r"[^0-9a-zA-Z_]+", "_", str(repo_id))
 
 # A4 portrait, inches, with standard 1-inch margins on every page.
 PAGE_SIZE = (8.27, 11.69)
@@ -755,6 +771,151 @@ def build_limitations_page() -> plt.Figure:
     return fig
 
 
+def _toc_rows_per_page() -> int:
+    """How many TOC rows fit on one page at TOC_ROW_LEADING_PTS leading,
+    below the heading reserve — computed from page geometry rather than a
+    hardcoded row count, so it stays correct if the page size or font size
+    here ever changes."""
+    available_in = CONTENT_HEIGHT * PAGE_SIZE[1] - TOC_HEADING_RESERVE_IN
+    row_height_in = TOC_ROW_LEADING_PTS / 72.0
+    return max(1, int(available_in // row_height_in))
+
+
+def _axes_row_rect_to_pdf_points(y_top_frac: float, y_bottom_frac: float) -> tuple[float, float, float, float]:
+    """Convert a TOC row's vertical band — expressed as axes-fraction
+    coordinates within the standard content axes that _new_page() builds
+    ([CONTENT_LEFT, CONTENT_BOTTOM, CONTENT_WIDTH, CONTENT_HEIGHT] in
+    figure-fraction) — into a PDF link-annotation rectangle in points,
+    spanning the full one-inch-margined content width."""
+    fig_y0 = CONTENT_BOTTOM + y_bottom_frac * CONTENT_HEIGHT
+    fig_y1 = CONTENT_BOTTOM + y_top_frac * CONTENT_HEIGHT
+    return (
+        CONTENT_LEFT * PAGE_SIZE[0] * 72, fig_y0 * PAGE_SIZE[1] * 72,
+        CONTENT_RIGHT * PAGE_SIZE[0] * 72, fig_y1 * PAGE_SIZE[1] * 72,
+    )
+
+
+def build_toc_pages(entries: list[tuple[str, str]], page_numbers: dict[str, int]) -> tuple[list[plt.Figure], list[dict]]:
+    """Render the Table of Contents as one or more pages (matplotlib can't
+    make text clickable itself — the returned link_specs are consumed later
+    by _add_pdf_navigation(), which turns each row into a real PDF Link
+    annotation once the pages have real, final page indices).
+
+    entries: [(display title, anchor name), ...] in the order they should
+    be listed and jumped to. page_numbers: anchor name -> final 1-based page
+    number, already resolved by the caller before this is built (so the
+    printed numbers are never a guess).
+    """
+    rows_per_page = _toc_rows_per_page()
+    n_pages = max(1, -(-len(entries) // rows_per_page))  # ceil division
+
+    figures: list[plt.Figure] = []
+    row_records = []  # (fig, ax, title_artist, page_artist, row_top, row_bottom, anchor, page_offset)
+    entry_idx = 0
+    for page_offset in range(n_pages):
+        fig, ax = _new_page()
+        if page_offset == 0:
+            ax.text(0.0, 0.98, "Table of Contents", transform=ax.transAxes, fontsize=17,
+                    fontweight="bold", va="top", color=INK_PRIMARY)
+            y = 0.98 - _leading(CONTENT_HEIGHT, 46)
+        else:
+            ax.text(0.0, 0.98, "Table of Contents (continued)", transform=ax.transAxes, fontsize=13,
+                    fontweight="bold", va="top", color=INK_SECONDARY)
+            y = 0.98 - _leading(CONTENT_HEIGHT, 34)
+
+        row_leading = _leading(CONTENT_HEIGHT, TOC_ROW_LEADING_PTS)
+        for title, anchor in entries[entry_idx: entry_idx + rows_per_page]:
+            row_top = y
+            indent = 0.035 if anchor.startswith("repository_") else 0.0
+            title_artist = ax.text(indent, y, title, transform=ax.transAxes, fontsize=TOC_FONT_SIZE,
+                                    color=INK_PRIMARY, va="top", ha="left")
+            page_artist = ax.text(1.0, y, str(page_numbers.get(anchor, "")), transform=ax.transAxes,
+                                   fontsize=TOC_FONT_SIZE, color=INK_PRIMARY, va="top", ha="right")
+            row_bottom = y - row_leading
+            row_records.append((fig, ax, title_artist, page_artist, row_top, row_bottom, anchor, page_offset))
+            y = row_bottom
+        entry_idx += rows_per_page
+        figures.append(fig)
+
+    # Dot leaders are drawn from each row's actual rendered text extents
+    # (measured after a draw pass), the same draw-then-measure pattern this
+    # file already uses to place Findings under a repository table — not a
+    # guessed character count, which would misalign under a proportional font.
+    for fig in figures:
+        fig.canvas.draw()
+    renderer_by_fig = {id(fig): fig.canvas.get_renderer() for fig in figures}
+
+    link_specs: list[dict] = []
+    for fig, ax, title_artist, page_artist, row_top, row_bottom, anchor, page_offset in row_records:
+        renderer = renderer_by_fig[id(fig)]
+        title_bbox = title_artist.get_window_extent(renderer)
+        page_bbox = page_artist.get_window_extent(renderer)
+        ax_bbox = ax.get_window_extent(renderer)
+        pad_px = 4
+        leader_x0 = (title_bbox.x1 + pad_px - ax_bbox.x0) / ax_bbox.width
+        leader_x1 = (page_bbox.x0 - pad_px - ax_bbox.x0) / ax_bbox.width
+        if leader_x1 > leader_x0:
+            leader_y = row_top - _leading(CONTENT_HEIGHT, 11)  # roughly the text's visual mid-height
+            ax.plot([leader_x0, leader_x1], [leader_y, leader_y], transform=ax.transAxes,
+                    linestyle=(0, (1, 2)), color=INK_MUTED, linewidth=1, zorder=1)
+
+        link_specs.append({
+            "page_offset": page_offset,
+            "rect": _axes_row_rect_to_pdf_points(row_top, row_bottom),
+            "anchor": anchor,
+        })
+
+    return figures, link_specs
+
+
+def _add_pdf_navigation(
+    path: Path,
+    anchor_page_numbers: dict[str, int],
+    repo_ids_processed: list[int],
+    toc_link_specs: list[dict],
+    toc_start_page_num: int,
+) -> None:
+    """Layer clickable navigation onto the already-rendered PDF: named
+    destinations and an outline/bookmark hierarchy for every section, plus a
+    Link annotation on each Table-of-Contents row pointing at its target
+    page. matplotlib's PdfPages backend has no API for any of this, so it
+    runs as a pypdf post-process over the finished file — the pages
+    themselves, their content, and their rendering are untouched; this only
+    adds navigation metadata on top."""
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.annotations import Link
+    from pypdf.generic import Fit
+
+    reader = PdfReader(str(path))
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    if reader.metadata:
+        writer.add_metadata(reader.metadata)
+
+    for anchor, page_num in anchor_page_numbers.items():
+        writer.add_named_destination(anchor, page_num - 1)
+
+    writer.add_outline_item("Methodology", anchor_page_numbers["methodology"] - 1)
+    writer.add_outline_item("Global Summary", anchor_page_numbers["global_summary"] - 1)
+    if repo_ids_processed:
+        first_repo_idx = anchor_page_numbers[_repo_anchor(repo_ids_processed[0])] - 1
+        repositories_parent = writer.add_outline_item("Repositories", first_repo_idx)
+        for repo_id in repo_ids_processed:
+            repo_idx = anchor_page_numbers[_repo_anchor(repo_id)] - 1
+            writer.add_outline_item(f"Repository {repo_id}", repo_idx, parent=repositories_parent)
+    writer.add_outline_item("Limitations", anchor_page_numbers["limitations"] - 1)
+
+    for spec in toc_link_specs:
+        toc_page_index = (toc_start_page_num - 1) + spec["page_offset"]
+        target_page_index = anchor_page_numbers[spec["anchor"]] - 1
+        link = Link(rect=spec["rect"], target_page_index=target_page_index, fit=Fit.fit())
+        writer.add_annotation(page_number=toc_page_index, annotation=link)
+
+    with open(path, "wb") as f:
+        writer.write(f)
+
+
 # ---------------------------------------------------------------------------
 # Assembly + validation
 # ---------------------------------------------------------------------------
@@ -794,20 +955,58 @@ def generate_report(
     # what other matplotlib-using modules import before or after it — see
     # REPORT_RC's comment above.
     with plt.rc_context(REPORT_RC):
-        # Build every page in memory first so the footer can print
-        # "Page X of Y" with a real total, then save them all in a second pass.
-        pages: list[plt.Figure] = []
-        pages.append(build_title_page(db_path, generated_at, global_stats))
-        pages.append(build_methodology_page(preferred_method, fallback_method))
-        pages.extend(build_global_summary_pages(global_stats, titles, preferred_method, fallback_method))
+        # --- Pass 1: build every content page except the TOC itself, so the
+        # exact page count of every section (methodology, global summary,
+        # each repository, limitations) is known from real rendered content
+        # rather than assumed. ---
+        title_fig = build_title_page(db_path, generated_at, global_stats)
+        methodology_fig = build_methodology_page(preferred_method, fallback_method)
+        global_summary_figs = build_global_summary_pages(global_stats, titles, preferred_method, fallback_method)
 
         repo_ids_processed: list[int] = []
+        repo_figs_by_id: dict[int, list[plt.Figure]] = {}
         for repo_id in sorted(by_repo.keys()):
-            pages.extend(build_repository_pages(repo_id, by_repo[repo_id], titles, top_n))
+            repo_figs_by_id[repo_id] = build_repository_pages(repo_id, by_repo[repo_id], titles, top_n)
             repo_ids_processed.append(repo_id)
 
-        pages.append(build_limitations_page())
-        total_pages = len(pages)
+        limitations_fig = build_limitations_page()
+
+        content_sections: list[tuple[str, list[plt.Figure]]] = [
+            ("methodology", [methodology_fig]),
+            ("global_summary", global_summary_figs),
+        ]
+        for repo_id in repo_ids_processed:
+            content_sections.append((_repo_anchor(repo_id), repo_figs_by_id[repo_id]))
+        content_sections.append(("limitations", [limitations_fig]))
+
+        toc_entries: list[tuple[str, str]] = [("Methodology", "methodology"), ("Global Summary", "global_summary")]
+        toc_entries += [(f"Repository {repo_id}", _repo_anchor(repo_id)) for repo_id in repo_ids_processed]
+        toc_entries.append(("Limitations", "limitations"))
+
+        # Required order is title, TOC, then content — the TOC's own page
+        # count depends only on how many entries it lists (known already),
+        # not on anything the TOC page itself renders, so this "second pass"
+        # is a direct calculation rather than a guess-and-retry loop.
+        rows_per_toc_page = _toc_rows_per_page()
+        n_toc_pages = max(1, -(-len(toc_entries) // rows_per_toc_page))
+        toc_start_page_num = 2  # title is page 1
+        first_content_page_num = toc_start_page_num + n_toc_pages
+
+        anchor_page_numbers: dict[str, int] = {}
+        running = first_content_page_num
+        for name, figs in content_sections:
+            anchor_page_numbers[name] = running
+            running += len(figs)
+        total_pages = running - 1
+
+        # --- Pass 2: now that every section's final page number is known,
+        # render the actual TOC content (never a guessed number). ---
+        toc_figs, toc_link_specs = build_toc_pages(toc_entries, anchor_page_numbers)
+
+        pages: list[plt.Figure] = [title_fig, *toc_figs]
+        for _name, figs in content_sections:
+            pages.extend(figs)
+        assert len(pages) == total_pages
 
         with tempfile.TemporaryDirectory() as _tmp_dir:
             # Any ad-hoc chart preview during generation would be written
@@ -817,13 +1016,20 @@ def generate_report(
             # in the normal path.
             with PdfPages(out_path) as pdf:
                 for i, fig in enumerate(pages, start=1):
-                    _add_footer(fig, i, total_pages)
+                    if i > 1:  # title page (1) keeps no footer; every other page gets one
+                        _add_footer(fig, i, total_pages)
                     pdf.savefig(fig)
                     plt.close(fig)
 
                 info = pdf.infodict()
                 info["Title"] = "QDArchive Project Classification Report"
                 info["Subject"] = f"Student {STUDENT_ID} — ISIC Rev. 5 classification statistics"
+
+    # matplotlib's PdfPages has no concept of internal links, named
+    # destinations, or an outline/bookmark sidebar — those are layered onto
+    # the already-saved file as a pypdf post-process rather than requiring a
+    # different rendering engine for any of the content above.
+    _add_pdf_navigation(out_path, anchor_page_numbers, repo_ids_processed, toc_link_specs, toc_start_page_num)
 
     return {
         "output_path": out_path,
@@ -832,7 +1038,23 @@ def generate_report(
         "global_stats": global_stats,
         "by_repo": by_repo,
         "titles": titles,
+        "anchor_page_numbers": anchor_page_numbers,
+        "toc_entries": toc_entries,
+        "toc_start_page_num": toc_start_page_num,
+        "n_toc_pages": n_toc_pages,
     }
+
+
+def _flatten_outline_titles(outline) -> set[str]:
+    """pypdf's .outline is a nested list (sub-lists for nested bookmarks);
+    flatten it to the set of every title present at any level."""
+    titles: set[str] = set()
+    for item in outline:
+        if isinstance(item, list):
+            titles |= _flatten_outline_titles(item)
+        else:
+            titles.add(item.get("/Title", ""))
+    return titles
 
 
 def _pdf_font_resource_names(path: Path) -> set[str]:
@@ -888,6 +1110,101 @@ def validate(result: dict, valid_codes: set[str]) -> list[dict]:
     if actual_pages is not None:
         add("page count matches generated pages", actual_pages == result["page_count"],
             f"{actual_pages} in file vs {result['page_count']} generated")
+
+    anchor_page_numbers: dict[str, int] = result.get("anchor_page_numbers", {})
+    toc_entries: list[tuple[str, str]] = result.get("toc_entries", [])
+    toc_start_page_num: int | None = result.get("toc_start_page_num")
+    n_toc_pages: int = result.get("n_toc_pages", 1)
+
+    if actual_pages is not None and toc_start_page_num is not None:
+        try:
+            toc_first_page_text = reader.pages[toc_start_page_num - 1].extract_text() or ""
+        except Exception as exc:
+            add("page 2 contains the Table of Contents", False, str(exc))
+        else:
+            add(
+                "page 2 contains the Table of Contents", toc_start_page_num == 2 and
+                "Table of Contents" in toc_first_page_text,
+                f"heading found on page {toc_start_page_num}" if "Table of Contents" in toc_first_page_text
+                else "heading not found",
+            )
+
+        add(
+            "every TOC entry has a resolved page number",
+            len(toc_entries) > 0 and all(anchor in anchor_page_numbers for _title, anchor in toc_entries),
+            f"{len(toc_entries)} entries",
+        )
+
+        expected_repo_anchors = {_repo_anchor(rid) for rid in result["repo_ids_processed"]}
+        toc_repo_anchors = {anchor for _title, anchor in toc_entries if anchor.startswith("repository_")}
+        add(
+            "no repository sections missing from the TOC",
+            expected_repo_anchors == toc_repo_anchors,
+            f"{len(toc_repo_anchors)} in TOC vs {len(expected_repo_anchors)} repositories",
+        )
+
+        try:
+            outline_titles = _flatten_outline_titles(reader.outline)
+            expected_top_level = {"Methodology", "Global Summary", "Limitations"}
+            if result["repo_ids_processed"]:
+                expected_top_level.add("Repositories")
+                expected_top_level |= {f"Repository {rid}" for rid in result["repo_ids_processed"]}
+            add(
+                "PDF bookmarks/outline present for every section",
+                expected_top_level.issubset(outline_titles),
+                f"missing: {sorted(expected_top_level - outline_titles)}" if not expected_top_level.issubset(outline_titles)
+                else f"{len(outline_titles)} outline entries",
+            )
+        except Exception as exc:
+            add("PDF bookmarks/outline present for every section", False, str(exc))
+
+        try:
+            rows_per_toc_page = _toc_rows_per_page()
+            total_links = 0
+            mismatched: list[str] = []
+            entry_idx = 0
+            for page_offset in range(n_toc_pages):
+                page = reader.pages[(toc_start_page_num - 1) + page_offset]
+                annots = page.get("/Annots") or []
+                link_annots = [a.get_object() for a in annots if a.get_object().get("/Subtype") == "/Link"]
+                total_links += len(link_annots)
+                for (_title, anchor), annot in zip(toc_entries[entry_idx:entry_idx + rows_per_toc_page], link_annots):
+                    dest = annot.get("/Dest")
+                    landed_page_idx = int(dest[0]) if dest else None
+                    if landed_page_idx != anchor_page_numbers.get(anchor, -1) - 1:
+                        mismatched.append(anchor)
+                entry_idx += rows_per_toc_page
+            add("every TOC entry is a clickable link", total_links == len(toc_entries),
+                f"{total_links} link annotations for {len(toc_entries)} TOC entries")
+            add("each TOC link lands on the correct section", len(mismatched) == 0,
+                "all correct" if not mismatched else f"mismatched: {mismatched}")
+        except Exception as exc:
+            add("every TOC entry is a clickable link", False, str(exc))
+            add("each TOC link lands on the correct section", False, str(exc))
+
+        try:
+            methodology_page_num = anchor_page_numbers["methodology"]
+            methodology_text = reader.pages[methodology_page_num - 1].extract_text() or ""
+            expected_footer = f"Page {methodology_page_num} of {result['page_count']}"
+            add(
+                "footer page numbers match TOC page numbers",
+                expected_footer in methodology_text,
+                f"looked for '{expected_footer}' on page {methodology_page_num}",
+            )
+        except Exception as exc:
+            add("footer page numbers match TOC page numbers", False, str(exc))
+
+        try:
+            mediabox = reader.pages[0].mediabox
+            width_in = float(mediabox.width) / 72
+            height_in = float(mediabox.height) / 72
+            add(
+                "A4 page dimensions preserved",
+                abs(width_in - PAGE_SIZE[0]) < 0.01 and abs(height_in - PAGE_SIZE[1]) < 0.01,
+                f"{width_in:.2f}in x {height_in:.2f}in",
+            )
+        except Exception as exc:
+            add("A4 page dimensions preserved", False, str(exc))
 
     try:
         font_names = _pdf_font_resource_names(out_path)
