@@ -17,9 +17,15 @@ Options:
     --provider      PROV          local-dry-run | openai  (default: local-dry-run)
     --model         MODEL         OpenAI model  (default: gpt-4o-mini)
     --target-type   TYPE          PROJECT (only supported value for now)
-    --limit         N             process at most N rows
+    --limit         N             process at most N rows (applied after resume filtering)
     --offset        N             skip first N rows
     --overwrite                   re-classify already-classified projects
+    --exclude-success-methods M   comma-separated list of methods; PROJECT inputs already
+                                   successfully classified by any method in this list are
+                                   skipped, e.g. openai:gpt-4o-mini,openai:gpt-4.1-mini
+                                   (default: the currently selected method only)
+    --resume-across-models        shorthand (openai provider only) for
+                                   --exclude-success-methods openai:gpt-4o-mini,openai:gpt-4.1-mini
     --sleep         SECS          pause between API calls (local-dry-run / sequential only)
     --max-input-chars N           truncate input_text to N chars (default: 6000)
     --concurrency   N             concurrent in-flight OpenAI requests (default: 5)
@@ -72,6 +78,7 @@ DEFAULT_INCREASE_THRESHOLD = 0.01
 DEFAULT_DECREASE_THRESHOLD = 0.05
 DEFAULT_INCREASE_STEP = 1
 DEFAULT_DECREASE_FACTOR = 0.5
+RESUME_ACROSS_MODELS_METHODS = ["openai:gpt-4o-mini", "openai:gpt-4.1-mini"]
 
 
 def _load_divisions(conn: sqlite3.Connection) -> tuple[list[dict], set[str]]:
@@ -86,22 +93,32 @@ def _load_inputs(
     target_type: str,
     limit: int | None,
     offset: int | None,
-    exclude_method: str | None = None,
+    exclude_methods: list[str] | None = None,
 ) -> list[dict]:
+    """Load PROJECT classification_inputs rows, optionally filtering out any
+    project already successfully classified by a method in exclude_methods.
+
+    'Successful' here means a project_classifications row whose method is one
+    of exclude_methods — error rows are stored under the separate 'model_error'
+    method, which is never in this list, so they never block a project from
+    being reprocessed. limit/offset are applied by the SQL LIMIT/OFFSET clause
+    after this filter, so --limit counts only rows that survive the filter.
+    """
     params: list = [target_type]
     sql = (
         "SELECT ci.id, ci.target_id, ci.project_id, ci.input_text "
         "FROM classification_inputs ci "
         "WHERE ci.target_type = ?"
     )
-    if exclude_method is not None:
+    if exclude_methods:
+        placeholders = ", ".join("?" for _ in exclude_methods)
         sql += (
             " AND NOT EXISTS ("
             "SELECT 1 FROM project_classifications pc "
             "WHERE pc.project_id = COALESCE(ci.project_id, ci.target_id) "
-            "AND pc.method = ?)"
+            f"AND pc.method IN ({placeholders}))"
         )
-        params.append(exclude_method)
+        params.extend(exclude_methods)
     sql += " ORDER BY ci.id"
     if offset:
         sql += " LIMIT -1 OFFSET ?"
@@ -114,6 +131,33 @@ def _load_inputs(
 
     rows = conn.execute(sql, params).fetchall()
     return [{"id": r[0], "target_id": r[1], "project_id": r[2], "input_text": r[3]} for r in rows]
+
+
+def _coverage_counts(
+    conn: sqlite3.Connection,
+    target_type: str,
+    methods: list[str],
+) -> tuple[int, int, int]:
+    """Return (total, completed, remaining) PROJECT input counts, where
+    'completed' means a project_classifications row exists with method in
+    `methods`. Mirrors the NOT EXISTS filter used by _load_inputs so the
+    pre-run summary matches what will actually be selected."""
+    total = conn.execute(
+        "SELECT COUNT(*) FROM classification_inputs WHERE target_type = ?",
+        (target_type,),
+    ).fetchone()[0]
+    if not methods:
+        return total, 0, total
+    placeholders = ", ".join("?" for _ in methods)
+    remaining = conn.execute(
+        "SELECT COUNT(*) FROM classification_inputs ci "
+        "WHERE ci.target_type = ? AND NOT EXISTS ("
+        "SELECT 1 FROM project_classifications pc "
+        "WHERE pc.project_id = COALESCE(ci.project_id, ci.target_id) "
+        f"AND pc.method IN ({placeholders}))",
+        [target_type, *methods],
+    ).fetchone()[0]
+    return total, total - remaining, remaining
 
 
 def _upsert_project_classification(
@@ -649,6 +693,7 @@ def run(
     decrease_threshold: float = DEFAULT_DECREASE_THRESHOLD,
     increase_step: int = DEFAULT_INCREASE_STEP,
     decrease_factor: float = DEFAULT_DECREASE_FACTOR,
+    exclude_success_methods: list[str] | None = None,
 ) -> dict[str, int]:
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode = WAL")
@@ -659,10 +704,35 @@ def run(
 
     method = f"{provider}:{model}" if provider == "openai" else provider
 
+    # accepted_methods is what counts as "already successfully classified" for
+    # resume purposes. Default: the currently selected method only (unchanged
+    # behavior). --exclude-success-methods / --resume-across-models widen this
+    # to treat prior success under any listed method as done, so gpt-4.1-mini
+    # only spends requests on projects neither accepted model has classified.
+    accepted_methods = list(exclude_success_methods) if exclude_success_methods else [method]
+
+    # --overwrite only affects the *current* method: it un-skips rows already
+    # done by `method` so they get reprocessed, but rows already done by a
+    # different accepted method (e.g. gpt-4o-mini) stay excluded — overwrite
+    # never causes those to be reclassified.
+    effective_exclude = [m for m in accepted_methods if not (overwrite and m == method)]
+
+    total_inputs, completed_by_accepted, remaining_by_accepted = _coverage_counts(
+        conn, target_type, accepted_methods
+    )
+    print("Resume filtering:")
+    print(f"  selected method                        : {method}")
+    print(
+        "  accepted success methods (exclusion)  : "
+        + (", ".join(accepted_methods) if accepted_methods else "none")
+    )
+    print(f"  total {target_type} inputs                    : {total_inputs:,}")
+    print(f"  already completed by an accepted model: {completed_by_accepted:,}")
+    print(f"  remaining unclassified by both models  : {remaining_by_accepted:,}")
+
     print(f"Loading {target_type} classification inputs...", flush=True)
-    exclude = None if overwrite else method
-    inputs = _load_inputs(conn, target_type, limit, offset, exclude_method=exclude)
-    print(f"  {len(inputs):,} inputs loaded (unclassified for method '{method}').", flush=True)
+    inputs = _load_inputs(conn, target_type, limit, offset, exclude_methods=effective_exclude)
+    print(f"  {len(inputs):,} inputs loaded (limit applied after resume filtering).", flush=True)
 
     if provider == "openai" and adaptive_concurrency:
         counters = _run_openai_adaptive(
@@ -696,6 +766,17 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--offset", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--exclude-success-methods", default=None,
+        help="comma-separated methods; PROJECT inputs already successfully classified by "
+             "any of these are skipped (default: the currently selected method only), e.g. "
+             "openai:gpt-4o-mini,openai:gpt-4.1-mini",
+    )
+    parser.add_argument(
+        "--resume-across-models", action="store_true",
+        help="shorthand (openai provider only) for --exclude-success-methods "
+             + ",".join(RESUME_ACROSS_MODELS_METHODS),
+    )
     parser.add_argument("--sleep", type=float, default=0.0)
     parser.add_argument("--max-input-chars", type=int, default=6000)
     parser.add_argument(
@@ -744,6 +825,18 @@ def main() -> None:
         print("ERROR: --min-concurrency cannot exceed --max-concurrency.", file=sys.stderr)
         sys.exit(1)
 
+    exclude_success_methods = None
+    if args.exclude_success_methods:
+        exclude_success_methods = [m.strip() for m in args.exclude_success_methods.split(",") if m.strip()]
+    elif args.resume_across_models:
+        if args.provider != "openai":
+            print(
+                "ERROR: --resume-across-models requires --provider openai.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        exclude_success_methods = list(RESUME_ACROSS_MODELS_METHODS)
+
     import os
     api_key = None
     if args.provider == "openai":
@@ -767,6 +860,7 @@ def main() -> None:
     print(f"  db          : {args.db}")
     print(f"  limit       : {args.limit or 'all'}")
     print(f"  overwrite   : {args.overwrite}")
+    print(f"  resume-across-models : {args.resume_across_models}")
     print()
 
     counters = run(
@@ -777,6 +871,7 @@ def main() -> None:
         limit=args.limit,
         offset=args.offset,
         overwrite=args.overwrite,
+        exclude_success_methods=exclude_success_methods,
         sleep_secs=args.sleep,
         max_input_chars=args.max_input_chars,
         api_key=api_key,

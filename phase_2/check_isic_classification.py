@@ -7,8 +7,17 @@ Checks:
   3. All classified project_id values exist in combined_projects
   4. Count breakdown by primary_class_code
 
+Combined production coverage (--combined-methods) additionally checks, across
+a set of accepted production methods (e.g. gpt-4o-mini and gpt-4.1-mini):
+  - distinct project_ids classified by either accepted method
+  - remaining PROJECT inputs unclassified by any accepted method
+  - counts by method
+  - overlap: projects classified by more than one accepted method
+  - no invalid codes / no orphan project_ids among accepted methods
+
 Usage:
     python phase_2/check_isic_classification.py [--db PATH]
+    python phase_2/check_isic_classification.py --combined-methods openai:gpt-4o-mini,openai:gpt-4.1-mini
 """
 
 import csv
@@ -18,6 +27,7 @@ from pathlib import Path
 
 DB_DEFAULT = "23727550-sq26-combined.db"
 VALIDATION_REPORT = "reports/isic_classification_validation.csv"
+COMBINED_COVERAGE_REPORT = "reports/isic_combined_coverage.csv"
 
 
 def run_checks(db_path: str, method: str | None = None) -> list[dict]:
@@ -113,12 +123,91 @@ def run_checks(db_path: str, method: str | None = None) -> list[dict]:
     return checks
 
 
+def run_combined_checks(db_path: str, methods: list[str]) -> list[dict]:
+    """Combined production coverage across multiple accepted methods, e.g.
+    openai:gpt-4o-mini and openai:gpt-4.1-mini treated together as "done"."""
+    conn = sqlite3.connect(db_path)
+    checks: list[dict] = []
+
+    def add(name: str, passed: bool, detail: str = "") -> None:
+        checks.append({"check": name, "status": "PASS" if passed else "FAIL", "detail": detail})
+
+    placeholders = ", ".join("?" for _ in methods)
+    methods_label = ", ".join(methods)
+
+    distinct_classified = conn.execute(
+        f"SELECT COUNT(DISTINCT project_id) FROM project_classifications WHERE method IN ({placeholders})",
+        methods,
+    ).fetchone()[0]
+    add(
+        f"distinct project_ids classified by accepted methods ({methods_label})",
+        True,
+        f"{distinct_classified:,} projects",
+    )
+
+    remaining = conn.execute(
+        "SELECT COUNT(*) FROM classification_inputs ci "
+        "WHERE ci.target_type = 'PROJECT' AND NOT EXISTS ("
+        "  SELECT 1 FROM project_classifications pc "
+        f"  WHERE pc.project_id = COALESCE(ci.project_id, ci.target_id) AND pc.method IN ({placeholders})"
+        ")",
+        methods,
+    ).fetchone()[0]
+    add("remaining PROJECT inputs unclassified by any accepted method", True, f"{remaining:,} remaining")
+
+    per_method_counts = [
+        (m, conn.execute("SELECT COUNT(*) FROM project_classifications WHERE method = ?", (m,)).fetchone()[0])
+        for m in methods
+    ]
+    counts_str = "; ".join(f"{m}={c:,}" for m, c in per_method_counts)
+    add("counts by method (informational)", True, counts_str)
+
+    overlap = conn.execute(
+        f"SELECT COUNT(*) FROM ("
+        f"  SELECT project_id FROM project_classifications"
+        f"  WHERE method IN ({placeholders})"
+        f"  GROUP BY project_id HAVING COUNT(DISTINCT method) > 1"
+        f")",
+        methods,
+    ).fetchone()[0]
+    add("overlap: projects classified by more than one accepted method", True, f"{overlap:,} overlapping projects")
+
+    invalid_codes = conn.execute(
+        f"SELECT COUNT(*) FROM project_classifications "
+        f"WHERE method IN ({placeholders}) AND primary_class_code IS NOT NULL "
+        f"AND primary_class_code NOT IN (SELECT code FROM isic_divisions)",
+        methods,
+    ).fetchone()[0]
+    add("no invalid ISIC codes among accepted methods", invalid_codes == 0, f"{invalid_codes} invalid codes")
+
+    orphan_pids = conn.execute(
+        f"SELECT COUNT(*) FROM project_classifications pc "
+        f"WHERE pc.method IN ({placeholders}) AND NOT EXISTS ("
+        "  SELECT 1 FROM combined_projects cp WHERE cp.global_project_id = pc.project_id"
+        ")",
+        methods,
+    ).fetchone()[0]
+    add(
+        "no orphan project_ids among accepted methods",
+        orphan_pids == 0,
+        f"{orphan_pids} orphan project_ids",
+    )
+
+    conn.close()
+    return checks
+
+
 def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="Validate ISIC classification results.")
     parser.add_argument("--db", default=DB_DEFAULT)
     parser.add_argument("--method", default=None, help="Restrict checks to a single method, e.g. openai:gpt-4o-mini")
+    parser.add_argument(
+        "--combined-methods", default=None,
+        help="comma-separated accepted production methods to report combined coverage for, "
+             "e.g. openai:gpt-4o-mini,openai:gpt-4.1-mini",
+    )
     args = parser.parse_args()
 
     print("Validating ISIC classification..." + (f" (method={args.method})" if args.method else ""))
@@ -142,6 +231,27 @@ def main() -> None:
     print()
     print(f"  {'PASS — all checks passed.' if all_pass else 'FAIL — see above.'}")
     print(f"  Report: {VALIDATION_REPORT}")
+
+    if args.combined_methods:
+        methods = [m.strip() for m in args.combined_methods.split(",") if m.strip()]
+        print(f"\nValidating combined production coverage (methods={', '.join(methods)})...")
+        combined_checks = run_combined_checks(args.db, methods)
+
+        with open(COMBINED_COVERAGE_REPORT, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["check", "status", "detail"])
+            w.writeheader()
+            w.writerows(combined_checks)
+
+        print("\nCombined coverage results:")
+        for c in combined_checks:
+            icon = "PASS" if c["status"] == "PASS" else "FAIL"
+            detail = f" ({c['detail']})" if c["detail"] else ""
+            print(f"  [{icon}] {c['check']}{detail}")
+            if c["status"] != "PASS":
+                all_pass = False
+
+        print()
+        print(f"  Report: {COMBINED_COVERAGE_REPORT}")
 
     if not all_pass:
         sys.exit(1)
