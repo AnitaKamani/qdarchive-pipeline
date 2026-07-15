@@ -61,6 +61,7 @@ DB_DEFAULT = "23727550-sq26-combined.db"
 SUMMARY_REPORT = "reports/isic_classification_summary.csv"
 ERRORS_REPORT = "reports/isic_classification_errors.csv"
 CONCURRENCY_HISTORY_REPORT = "reports/isic_concurrency_history.csv"
+CODE_CORRECTIONS_REPORT = "reports/isic_code_corrections.csv"
 PROGRESS_INTERVAL = 50
 DEFAULT_CONCURRENCY = 5
 DEFAULT_MAX_RETRIES = 5
@@ -162,6 +163,24 @@ def _write_errors_report(error_rows: list[dict]) -> None:
         w.writeheader()
         w.writerows(error_rows)
     print(f"  Errors written to {ERRORS_REPORT}", flush=True)
+
+
+def _write_code_corrections_report(rows: list[dict]) -> None:
+    Path("reports").mkdir(parents=True, exist_ok=True)
+    with open(CODE_CORRECTIONS_REPORT, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f, fieldnames=["project_id", "returned_code", "corrected_code", "matched_title", "reason"]
+        )
+        w.writeheader()
+        w.writerows(rows)
+    print(f"  Code corrections written to {CODE_CORRECTIONS_REPORT}", flush=True)
+
+
+def _merge_retry_exception_types(counters: dict, result: Result) -> None:
+    for exc_name, count in result.get("retry_exception_types", {}).items():
+        counters["retry_exception_types"][exc_name] = counters["retry_exception_types"].get(exc_name, 0) + count
+    if result.get("retry_after_seen"):
+        counters["requests_with_retry_after"] += 1
 
 
 _CONCURRENCY_HISTORY_HEADER = [
@@ -294,8 +313,12 @@ def _run_openai_concurrent(
         print("ERROR: openai package not installed; run: pip install openai", file=sys.stderr)
         sys.exit(1)
 
-    counters = {"processed": 0, "inserted": 0, "errors": 0, "retries": 0}
+    counters = {
+        "processed": 0, "inserted": 0, "errors": 0, "retries": 0,
+        "retry_exception_types": {}, "requests_with_retry_after": 0, "code_corrections": 0,
+    }
     error_rows: list[dict] = []
+    code_corrections: list[dict] = []
     abort: dict[str, str | None] = {"reason": None}
 
     async def _drive() -> None:
@@ -360,9 +383,13 @@ def _run_openai_concurrent(
                 else:
                     _upsert_project_classification(conn, project_id, result, method)
                     counters["inserted"] += 1
+                    if result.get("code_correction"):
+                        counters["code_corrections"] += 1
+                        code_corrections.append({"project_id": project_id, **result["code_correction"]})
 
                 counters["processed"] += 1
                 counters["retries"] += result.get("retries", 0)
+                _merge_retry_exception_types(counters, result)
                 bar.set_postfix(
                     inserted=counters["inserted"],
                     errors=counters["errors"],
@@ -396,6 +423,8 @@ def _run_openai_concurrent(
 
     if error_rows:
         _write_errors_report(error_rows)
+    if code_corrections:
+        _write_code_corrections_report(code_corrections)
 
     return counters
 
@@ -442,8 +471,12 @@ def _run_openai_adaptive(
     )
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
-    counters = {"processed": 0, "inserted": 0, "errors": 0, "retries": 0, "requests_retried": 0}
+    counters = {
+        "processed": 0, "inserted": 0, "errors": 0, "retries": 0, "requests_retried": 0,
+        "retry_exception_types": {}, "requests_with_retry_after": 0, "code_corrections": 0,
+    }
     error_rows: list[dict] = []
+    code_corrections: list[dict] = []
     abort: dict[str, str | None] = {"reason": None}
 
     async def _drive() -> None:
@@ -521,6 +554,9 @@ def _run_openai_adaptive(
                         _upsert_project_classification(conn, project_id, result, method)
                         counters["inserted"] += 1
                         window_inserted += 1
+                        if result.get("code_correction"):
+                            counters["code_corrections"] += 1
+                            code_corrections.append({"project_id": project_id, **result["code_correction"]})
 
                     if retries > 0:
                         counters["requests_retried"] += 1
@@ -528,6 +564,7 @@ def _run_openai_adaptive(
                     counters["retries"] += retries
                     window_retry_events += retries
                     window_completed += 1
+                    _merge_retry_exception_types(counters, result)
 
                     counters["processed"] += 1
                     bar.set_postfix(
@@ -585,6 +622,8 @@ def _run_openai_adaptive(
 
     if error_rows:
         _write_errors_report(error_rows)
+    if code_corrections:
+        _write_code_corrections_report(code_corrections)
 
     return counters
 
@@ -758,8 +797,14 @@ def main() -> None:
     print("Summary")
     print("=" * 64)
     for k, v in counters.items():
-        print(f"  {k:<20}: {v:,}")
-    print(f"  report              : {SUMMARY_REPORT}")
+        if isinstance(v, dict):
+            shown = ", ".join(f"{name}={count}" for name, count in sorted(v.items())) or "none"
+            print(f"  {k:<24}: {shown}")
+        else:
+            print(f"  {k:<24}: {v:,}")
+    print(f"  summary report          : {SUMMARY_REPORT}")
+    if counters.get("code_corrections", 0) > 0:
+        print(f"  code corrections report : {CODE_CORRECTIONS_REPORT}")
     print("=" * 64)
 
     if counters["errors"] > 0:

@@ -180,6 +180,46 @@ def _build_user_prompt(input_text: str, divisions: list[dict], max_chars: int) -
     )
 
 
+def _build_response_format(valid_codes: set[str]) -> dict:
+    """Structured-output schema constraining primary/secondary_class_code to the
+    exact set of codes loaded from isic_divisions, so the model cannot invent a
+    code string. secondary_class_code is nullable via anyOf, per OpenAI's
+    documented pattern for optional fields under strict Structured Outputs."""
+    codes = sorted(valid_codes)
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "isic_classification",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "primary_class_code": {
+                        "type": "string",
+                        "enum": codes,
+                    },
+                    "secondary_class_code": {
+                        "anyOf": [
+                            {"type": "string", "enum": codes},
+                            {"type": "null"},
+                        ],
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "confidence": {"type": "number"},
+                    "reason": {"type": "string"},
+                },
+                "required": [
+                    "primary_class_code", "secondary_class_code", "tags", "confidence", "reason",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
 def _validate_result(result: dict, valid_codes: set[str]) -> list[str]:
     errors = []
     code = result.get("primary_class_code")
@@ -201,8 +241,55 @@ def _is_fatal_api_error(msg: str) -> bool:
     return "401" in msg or "authentication" in low or "incorrect api key" in low or "invalid_api_key" in low
 
 
-def _parse_model_response(raw: str, valid_codes: set[str]) -> Result:
-    """Parse and validate a raw chat-completion string into a Result dict."""
+def _normalize_title(text: str) -> str:
+    t = text.strip().lower()
+    t = re.sub(r"[^\w\s]", " ", t)
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()
+
+
+def find_code_by_title_mention(text: str, divisions: list[dict]) -> tuple[str, str] | None:
+    """Search `text` for an exact (normalized) mention of a division title.
+
+    Returns (code, title) only if exactly one division's title is present —
+    a loose paraphrase that doesn't match any stored title verbatim, or text
+    that matches more than one unrelated title, both correctly yield None so
+    the caller keeps the row as an error rather than guessing. A short title
+    that is itself a substring of a longer matched title (e.g. "Accommodation"
+    inside "...without accommodation") is not treated as real ambiguity — the
+    longer, more specific match wins.
+    """
+    if not text:
+        return None
+    norm_text = _normalize_title(text)
+    matches: list[tuple[str, str, str]] = []
+    for d in divisions:
+        norm_title = _normalize_title(d["title"])
+        if norm_title and norm_title in norm_text:
+            matches.append((d["code"], d["title"], norm_title))
+    if not matches:
+        return None
+
+    specific = [
+        (code, title) for code, title, norm_title in matches
+        if not any(norm_title != other_norm and norm_title in other_norm for _, _, other_norm in matches)
+    ]
+    unique_codes = {code for code, _ in specific}
+    if len(unique_codes) == 1:
+        return specific[0]
+    return None
+
+
+def _parse_model_response(raw: str, valid_codes: set[str], divisions: list[dict]) -> Result:
+    """Parse and validate a raw chat-completion string into a Result dict.
+
+    Structured Outputs (see _build_response_format) constrains primary/
+    secondary_class_code to the exact isic_divisions codes at the API level,
+    so an invalid code should not occur in normal operation. As defense in
+    depth — and to recover any legacy/non-structured responses — an invalid
+    primary_class_code is corrected when `reason` names exactly one division
+    title verbatim; otherwise the row is kept as an error, never guessed.
+    """
     # Strip markdown code fences and extract JSON object if surrounded by extra text.
     cleaned = raw.strip()
     if cleaned.startswith("```"):
@@ -235,6 +322,28 @@ def _parse_model_response(raw: str, valid_codes: set[str]) -> Result:
     if isinstance(tags_raw, str):
         parsed["tags"] = [t.strip() for t in tags_raw.split(",") if t.strip()]
 
+    reason_text = str(parsed.get("reason", ""))
+    correction: dict | None = None
+
+    primary_code = parsed.get("primary_class_code")
+    if primary_code not in valid_codes:
+        match = find_code_by_title_mention(reason_text, divisions)
+        if match is not None:
+            matched_code, matched_title = match
+            correction = {
+                "returned_code": primary_code,
+                "corrected_code": matched_code,
+                "matched_title": matched_title,
+                "reason": reason_text,
+            }
+            parsed["primary_class_code"] = matched_code
+
+    # secondary_class_code is optional metadata: an invalid value is dropped
+    # rather than corrected-by-guess or failing the whole classification.
+    sec_code = parsed.get("secondary_class_code")
+    if sec_code is not None and sec_code not in valid_codes:
+        parsed["secondary_class_code"] = None
+
     errors = _validate_result(parsed, valid_codes)
     if errors:
         return {**_make_error(f"validation failed: {'; '.join(errors)}"), "raw_model_output": raw[:1000]}
@@ -243,13 +352,16 @@ def _parse_model_response(raw: str, valid_codes: set[str]) -> Result:
     if not isinstance(tags, list):
         tags = []
 
-    return {
+    result = {
         "primary_class_code": parsed["primary_class_code"],
         "secondary_class_code": parsed.get("secondary_class_code"),
         "tags": [str(t) for t in tags[:20]],
         "confidence": float(parsed.get("confidence", 0.0)),
-        "reason": str(parsed.get("reason", ""))[:500],
+        "reason": reason_text[:500],
     }
+    if correction is not None:
+        result["code_correction"] = correction
+    return result
 
 
 def _chat_messages(input_text: str, divisions: list[dict], max_input_chars: int) -> list[dict]:
@@ -284,7 +396,7 @@ def classify_openai(
             messages=_chat_messages(input_text, divisions, max_input_chars),
             temperature=0.0,
             max_tokens=300,
-            response_format={"type": "json_object"},
+            response_format=_build_response_format(valid_codes),
         )
     except Exception as exc:
         msg = str(exc)
@@ -292,7 +404,7 @@ def classify_openai(
         return {**_make_error(f"API error: {msg[:400]}"), "raw_model_output": "", "fatal": fatal}
 
     raw = response.choices[0].message.content or ""
-    return _parse_model_response(raw, valid_codes)
+    return _parse_model_response(raw, valid_codes, divisions)
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +430,22 @@ def _is_auth_exception(exc: Exception) -> bool:
     return isinstance(exc, openai.AuthenticationError)
 
 
+def _extract_retry_after(exc: Exception) -> float | None:
+    """Return the server's Retry-After hint in seconds, if the exception
+    carries an httpx response with that header (typical on 429s)."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    value = headers.get("retry-after")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 async def classify_openai_async(
     input_text: str,
     valid_codes: set[str],
@@ -330,9 +458,19 @@ async def classify_openai_async(
     """Async equivalent of classify_openai, with exponential-backoff retry
     on transient errors. `client` must be an openai.AsyncOpenAI instance,
     created once and shared across concurrent calls for connection reuse.
+
+    Every retryable exception is tallied by type in the returned Result's
+    "retry_exception_types" so callers can report, e.g., how many retries
+    were RateLimitError vs InternalServerError. "retry_after_seen" records
+    whether any 429 on this request carried a Retry-After header — lower
+    concurrency alone does not fix a token-per-minute limit, so this is
+    diagnostic information, not a behavior change to the backoff itself.
     """
     messages = _chat_messages(input_text, divisions, max_input_chars)
+    response_format = _build_response_format(valid_codes)
     retries = 0
+    retry_exception_types: dict[str, int] = {}
+    retry_after_seen = False
 
     while True:
         try:
@@ -341,7 +479,7 @@ async def classify_openai_async(
                 messages=messages,
                 temperature=0.0,
                 max_tokens=300,
-                response_format={"type": "json_object"},
+                response_format=response_format,
             )
         except Exception as exc:
             if _is_auth_exception(exc):
@@ -350,8 +488,14 @@ async def classify_openai_async(
                     "raw_model_output": "",
                     "fatal": True,
                     "retries": retries,
+                    "retry_exception_types": retry_exception_types,
+                    "retry_after_seen": retry_after_seen,
                 }
             if _is_retryable_exception(exc) and retries < max_retries:
+                exc_name = type(exc).__name__
+                retry_exception_types[exc_name] = retry_exception_types.get(exc_name, 0) + 1
+                if _extract_retry_after(exc) is not None:
+                    retry_after_seen = True
                 delay = min(30.0, (2 ** retries)) + random.uniform(0, 1)
                 retries += 1
                 await asyncio.sleep(delay)
@@ -362,11 +506,15 @@ async def classify_openai_async(
                 "raw_model_output": "",
                 "fatal": _is_fatal_api_error(msg),
                 "retries": retries,
+                "retry_exception_types": retry_exception_types,
+                "retry_after_seen": retry_after_seen,
             }
 
         raw = response.choices[0].message.content or ""
-        result = _parse_model_response(raw, valid_codes)
+        result = _parse_model_response(raw, valid_codes, divisions)
         result["retries"] = retries
+        result["retry_exception_types"] = retry_exception_types
+        result["retry_after_seen"] = retry_after_seen
         return result
 
 
