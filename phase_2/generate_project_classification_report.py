@@ -12,6 +12,15 @@ always covers the full eligible population per repository — coverage and
 unclassified counts are reported honestly regardless of how complete
 production classification currently is.
 
+A note on "repository_id": it is assigned locally by each contributing
+student's own harvesting configuration (see config.py's REPOS list) and is
+not a globally unique identifier — the same numeric ID can denote different
+real-world source repositories across students. Repository 99 was inspected
+specifically (see project history) and found to be genuine, correctly
+classified data (a Zenodo-sourced project), not an artifact, so it is kept
+in every output like any other repository. This caveat is stated explicitly
+in the report's Limitations section rather than silently omitted.
+
 Usage:
     python phase_2/generate_project_classification_report.py [options]
 
@@ -20,13 +29,15 @@ Options:
     --output            PATH   default: reports/23727550-sq26-project-classification-report.pdf
     --preferred-method  METHOD default: openai:gpt-4.1-mini
     --fallback-method   METHOD default: openai:gpt-4o-mini
-    --top-n             N      default: 20
+    --top-n             N      default: 20 (table rows; charts show a smaller
+                                CHART_TOP_N for label readability at reduced size)
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import logging
 import sys
 import tempfile
 import textwrap
@@ -60,25 +71,53 @@ DB_DEFAULT = "23727550-sq26-combined.db"
 OUTPUT_DEFAULT = "reports/23727550-sq26-project-classification-report.pdf"
 VALIDATION_REPORT = "reports/project_classification_report_validation.csv"
 TOP_N_DEFAULT = 20
+CHART_TOP_N = 12  # bar charts show fewer classes than the table so wrapped labels stay readable at reduced size
 STUDENT_ID = "23727550"
-PAGE_SIZE = (8.27, 11.69)  # A4 portrait, inches
+AUTHOR = "Fatemeh Kamani"
+SUPERVISOR = "Prof. Riehle"
+REPORT_DATE = "July 2026"
 
-# --- Palette (consistent with the rest of the evaluation deliverables) ---
+# A4 portrait, inches, with standard 1-inch margins on every page.
+PAGE_SIZE = (8.27, 11.69)
+MARGIN_IN = 1.0
+CONTENT_LEFT = MARGIN_IN / PAGE_SIZE[0]
+CONTENT_RIGHT = 1 - MARGIN_IN / PAGE_SIZE[0]
+CONTENT_BOTTOM = MARGIN_IN / PAGE_SIZE[1]
+CONTENT_TOP = 1 - MARGIN_IN / PAGE_SIZE[1]
+CONTENT_WIDTH = CONTENT_RIGHT - CONTENT_LEFT
+CONTENT_HEIGHT = CONTENT_TOP - CONTENT_BOTTOM
+FOOTER_Y = 0.4 / PAGE_SIZE[1]  # 0.4in from the bottom edge, inside the margin band
+
+# --- Palette: a single consistent blue family throughout the report ---
 SURFACE = "#fcfcfb"
 INK_PRIMARY = "#0b0b0b"
 INK_SECONDARY = "#52514e"
 INK_MUTED = "#898781"
 GRIDLINE = "#e1e0d9"
 BASELINE = "#c3c2b7"
-HEADER_FILL = "#2a3a3a"
-SEQUENTIAL_BLUE = LinearSegmentedColormap.from_list("seq_blue", ["#cde2fb", "#0d366b"])
+BLUE_DARK = "#0d366b"    # table/section headers, darkest chart bars, "classified" pie slice
+BLUE_LIGHT = "#9ec5f4"   # "remaining" pie slice, light chart bars
+SEQUENTIAL_BLUE = LinearSegmentedColormap.from_list("seq_blue", ["#cde2fb", BLUE_DARK])
+
+# Calibri is the preferred typeface; where it isn't installed, matplotlib's
+# font-family fallback chain resolves to the next available name (Helvetica,
+# then Arial, then the bundled DejaVu Sans) without raising an error. The
+# "Font family not found" notice this produces for the first (unavailable)
+# name is expected and not a fault — silence it rather than let it clutter
+# console output on every run.
+logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
 
 plt.rcParams.update({
     "figure.facecolor": SURFACE,
     "axes.facecolor": SURFACE,
     "savefig.facecolor": SURFACE,
     "text.color": INK_PRIMARY,
-    "font.family": ["Georgia", "DejaVu Serif", "serif"],
+    "font.family": ["Calibri", "Helvetica", "Arial", "DejaVu Sans"],
+    # All pages are built in memory before any is saved (so the footer can
+    # print a real "Page X of Y"), so it's normal to have dozens of figures
+    # open at once here — not a leak, so the default open-figure warning
+    # would just be noise on every run.
+    "figure.max_open_warning": 0,
 })
 
 
@@ -86,8 +125,38 @@ plt.rcParams.update({
 # Small helpers
 # ---------------------------------------------------------------------------
 
-def _truncate(text: str, max_len: int) -> str:
-    return text if len(text) <= max_len else text[: max_len - 1].rstrip() + "…"
+def _wrap_label(text: str, width: int, max_lines: int = 2) -> str:
+    """Word-wrap to at most `max_lines` lines instead of truncating with an
+    ellipsis mid-word. Only the small number of ISIC titles long enough to
+    exceed max_lines at this width fall back to a soft ellipsis on the last
+    line, so the common case is always a full, readable label."""
+    lines = textwrap.wrap(text, width=width) or [""]
+    if len(lines) <= max_lines:
+        return "\n".join(lines)
+    kept = lines[:max_lines]
+    last = kept[-1]
+    if len(last) > width - 1:
+        last = last[: width - 1].rstrip()
+    kept[-1] = last + "…"
+    return "\n".join(kept)
+
+
+def _label_ink(hex_color: str) -> str:
+    """White text on a dark fill, dark ink on a light fill."""
+    r, g, b = (int(hex_color.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+    luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return "#ffffff" if luminance < 140 else INK_PRIMARY
+
+
+def _leading(axes_height_fraction: float, points: float) -> float:
+    """Axes-fraction vertical step corresponding to `points` (1/72 inch) of
+    actual page space. Text is drawn with `transform=ax.transAxes`, so a
+    fixed axes-fraction step means a different absolute line height on every
+    differently-sized sub-axes unless it's rescaled by that axes' own height
+    — this converts a desired physical line height into the right fraction
+    for whichever axes it's drawn into."""
+    axes_height_in = axes_height_fraction * PAGE_SIZE[1]
+    return (points / 72.0) / axes_height_in
 
 
 def _style_axes(ax) -> None:
@@ -98,10 +167,18 @@ def _style_axes(ax) -> None:
 
 
 def _new_page() -> tuple[plt.Figure, plt.Axes]:
+    """A blank A4 page with one axes spanning the standard 1-inch content box."""
     fig = plt.figure(figsize=PAGE_SIZE)
-    ax = fig.add_axes([0.08, 0.06, 0.84, 0.88])
+    ax = fig.add_axes([CONTENT_LEFT, CONTENT_BOTTOM, CONTENT_WIDTH, CONTENT_HEIGHT])
     ax.axis("off")
     return fig, ax
+
+
+def _add_footer(fig: plt.Figure, page_num: int, total_pages: int) -> None:
+    fig.text(
+        0.5, FOOTER_Y, f"{AUTHOR} | Project Classification Report | Page {page_num} of {total_pages}",
+        ha="center", va="center", fontsize=8, color=INK_MUTED,
+    )
 
 
 def _draw_lines(ax, x: float, y: float, lines: list[str], fontsize: float = 11,
@@ -221,20 +298,81 @@ def generate_comments(stats: dict, titles: dict[str, str]) -> list[str]:
 # Page builders
 # ---------------------------------------------------------------------------
 
-def build_title_page(db_path: str, generated_at: str, global_stats: dict) -> plt.Figure:
-    fig, ax = _new_page()
-    ax.text(0.5, 0.62, "QDArchive Project Classification Report", transform=ax.transAxes,
-            fontsize=22, fontweight="bold", ha="center", color=INK_PRIMARY)
-    ax.text(0.5, 0.56, "ISIC Rev. 5 classification of QDA/QD projects", transform=ax.transAxes,
-            fontsize=13, ha="center", color=INK_SECONDARY)
-    ax.text(0.5, 0.46, f"Student ID: {STUDENT_ID}", transform=ax.transAxes, fontsize=11, ha="center", color=INK_SECONDARY)
-    ax.text(0.5, 0.42, f"Database: {Path(db_path).name}", transform=ax.transAxes, fontsize=11, ha="center", color=INK_SECONDARY)
-    ax.text(0.5, 0.38, f"Generated: {generated_at}", transform=ax.transAxes, fontsize=11, ha="center", color=INK_SECONDARY)
-    ax.text(
-        0.5, 0.30,
-        f"{global_stats['total']:,} eligible projects across {global_stats['num_repositories']} repositories",
-        transform=ax.transAxes, fontsize=11, ha="center", color=INK_MUTED,
+def build_title_page(db_path: str, generated_at: str, global_stats: dict,
+                      preferred_method: str, fallback_method: str) -> plt.Figure:
+    """Title block plus a compact executive-summary table sharing the same
+    page, so the report leads with the key figures without a near-empty page."""
+    fig = plt.figure(figsize=PAGE_SIZE)
+
+    title_h = CONTENT_HEIGHT * 0.46
+    title_ax = fig.add_axes([CONTENT_LEFT, CONTENT_TOP - title_h, CONTENT_WIDTH, title_h])
+    title_ax.axis("off")
+
+    rounded_thousands = (global_stats["total"] // 1000) * 1000
+    lines_top = [
+        (0.86, "QDArchive Project Classification Report", 20, "bold", INK_PRIMARY),
+        (0.76, "ISIC Rev. 5 classification of QDA/QD projects", 12.5, "normal", INK_SECONDARY),
+    ]
+    for y, text, fontsize, weight, color in lines_top:
+        title_ax.text(0.5, y, text, transform=title_ax.transAxes, fontsize=fontsize, fontweight=weight,
+                       ha="center", color=color)
+
+    meta_lines = [
+        f"Author: {AUTHOR}",
+        f"Supervisor: {SUPERVISOR}",
+        f"Date: {REPORT_DATE}",
+        "",
+        f"Student ID: {STUDENT_ID}",
+        f"Database: {Path(db_path).name}",
+        f"Generated: {generated_at}",
+    ]
+    y = 0.60
+    for line in meta_lines:
+        if line:
+            title_ax.text(0.5, y, line, transform=title_ax.transAxes, fontsize=11, ha="center", color=INK_SECONDARY)
+        y -= 0.075
+
+    title_ax.text(
+        0.5, 0.04,
+        f"More than {rounded_thousands:,} eligible projects across "
+        f"{global_stats['num_repositories']} successfully processed repositories",
+        transform=title_ax.transAxes, fontsize=10.5, ha="center", color=INK_MUTED,
     )
+
+    # --- Executive summary table, sharing the page rather than a near-empty one ---
+    summary_h = CONTENT_HEIGHT * 0.30
+    summary_top = CONTENT_TOP - title_h - CONTENT_HEIGHT * 0.06
+    heading_ax = fig.add_axes([CONTENT_LEFT, summary_top - 0.03, CONTENT_WIDTH, 0.03])
+    heading_ax.axis("off")
+    heading_ax.text(0.0, 1.0, "Executive Summary", transform=heading_ax.transAxes, fontsize=14,
+                     fontweight="bold", va="top", color=INK_PRIMARY)
+
+    table_ax = fig.add_axes([CONTENT_LEFT, summary_top - 0.06 - summary_h, CONTENT_WIDTH, summary_h])
+    table_ax.axis("off")
+
+    coverage_pct = (global_stats["classified_count"] / global_stats["total"] * 100) if global_stats["total"] else 0.0
+    rows = [
+        ["Eligible projects", f"{global_stats['total']:,}"],
+        ["Classified projects", f"{global_stats['classified_count']:,}"],
+        ["Coverage", f"{coverage_pct:.1f}%"],
+        ["Successfully processed repositories", f"{global_stats['num_repositories']}"],
+        ["Primary classification models", f"{preferred_method} (preferred), {fallback_method} (fallback)"],
+    ]
+    table = table_ax.table(
+        cellText=rows, colLabels=["Metric", "Value"], loc="upper center", cellLoc="left",
+        colWidths=[0.45, 0.55],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9.5)
+    table.scale(1, 1.9)
+    for (row, _col), cell in table.get_celld().items():
+        cell.set_edgecolor(GRIDLINE)
+        if row == 0:
+            cell.set_text_props(fontweight="bold", color="white")
+            cell.set_facecolor(BLUE_DARK)
+        else:
+            cell.set_facecolor(SURFACE)
+
     return fig
 
 
@@ -265,15 +403,12 @@ def build_methodology_page(preferred_method: str, fallback_method: str) -> plt.F
         "statistics below: coverage and remaining-unclassified counts are reported for every repository "
         "and for the archive as a whole.",
     ]
-    _draw_paragraphs(ax, 0.0, 0.92, paragraphs, fontsize=10.5, wrap_width=92, line_spacing=0.026)
+    _draw_paragraphs(ax, 0.0, 0.94, paragraphs, fontsize=10.5, wrap_width=92,
+                      line_spacing=_leading(CONTENT_HEIGHT, 15), para_gap=_leading(CONTENT_HEIGHT, 9))
     return fig
 
 
-def _build_stats_text_page(title: str, stats: dict, extra_lines: list[str] | None = None) -> plt.Figure:
-    fig, ax = _new_page()
-    ax.text(0.0, 0.98, title, transform=ax.transAxes, fontsize=17, fontweight="bold", color=INK_PRIMARY)
-
-    y = 0.90
+def _stats_lines(stats: dict, extra_lines: list[str] | None = None) -> list[str]:
     lines = [
         f"Total eligible projects: {stats['total']:,}",
         f"Classified: {stats['classified_count']:,}      Unclassified: {stats['unclassified_count']:,}",
@@ -286,18 +421,60 @@ def _build_stats_text_page(title: str, stats: dict, extra_lines: list[str] | Non
     if extra_lines:
         lines.append("")
         lines.extend(extra_lines)
+    return lines
 
-    y = _draw_lines(ax, 0.0, y, lines, fontsize=11, line_spacing=0.032)
-    return fig
+
+def _build_pie_chart(ax, classified: int, unclassified: int) -> None:
+    total = classified + unclassified
+    ax.set_title("Classified vs Remaining", fontsize=11.5, fontweight="bold", color=INK_PRIMARY, pad=10)
+    if total == 0:
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No eligible projects.", ha="center", va="center", transform=ax.transAxes, color=INK_MUTED)
+        return
+
+    values = [classified, unclassified]
+    colors = [BLUE_DARK, BLUE_LIGHT]
+    wedges, _texts, autotexts = ax.pie(
+        values, colors=colors, startangle=90, counterclock=False,
+        autopct=lambda pct: f"{pct:.1f}%",
+        pctdistance=0.7, wedgeprops={"edgecolor": SURFACE, "linewidth": 2},
+        textprops={"fontsize": 9.5, "fontweight": "bold"},
+    )
+    for at, color in zip(autotexts, colors):
+        at.set_color(_label_ink(color))
+    ax.legend(
+        wedges, [f"Classified ({classified:,})", f"Remaining ({unclassified:,})"],
+        loc="upper center", bbox_to_anchor=(0.5, -0.02), ncol=1, frameon=False, fontsize=8.8,
+    )
+    ax.set_aspect("equal")
 
 
 def build_global_summary_pages(global_stats: dict, titles: dict[str, str]) -> list[plt.Figure]:
+    fig = plt.figure(figsize=PAGE_SIZE)
+    head_h = 0.05
+    head_ax = fig.add_axes([CONTENT_LEFT, CONTENT_TOP - head_h, CONTENT_WIDTH, head_h])
+    head_ax.axis("off")
+    head_ax.text(0.0, 1.0, "Global Summary", transform=head_ax.transAxes, fontsize=17, fontweight="bold",
+                 va="top", color=INK_PRIMARY)
+
+    body_top = CONTENT_TOP - head_h - 0.02
+    body_h = body_top - CONTENT_BOTTOM
+    stats_w = CONTENT_WIDTH * 0.56
+    stats_ax = fig.add_axes([CONTENT_LEFT, body_top - body_h, stats_w, body_h])
+    stats_ax.axis("off")
     extra = [f"Distinct ISIC classes observed: {len(global_stats['class_counts'])}"] if global_stats["class_counts"] else []
-    page1 = _build_stats_text_page("Global Summary", global_stats, extra_lines=extra)
-    pages = [page1]
+    lines = _stats_lines(global_stats, extra_lines=extra)
+    _draw_lines(stats_ax, 0.0, 0.97, lines, fontsize=11, line_spacing=_leading(body_h, 20))
+
+    pie_w = CONTENT_WIDTH * 0.38
+    pie_left = CONTENT_LEFT + CONTENT_WIDTH * 0.62
+    pie_ax = fig.add_axes([pie_left, body_top - body_h * 0.62, pie_w, body_h * 0.55])
+    _build_pie_chart(pie_ax, global_stats["classified_count"], global_stats["unclassified_count"])
+
+    pages = [fig]
     chart = _build_bar_chart_page(
-        global_stats["class_counts"], titles, top_n=15,
-        chart_title="Top 15 Primary ISIC Classes — All Repositories",
+        global_stats["class_counts"], titles, top_n=CHART_TOP_N,
+        chart_title=f"Top {min(CHART_TOP_N, len(global_stats['class_counts']))} Primary ISIC Classes — All Repositories",
         subtitle=f"{global_stats['classified_count']:,} classified projects across "
                  f"{global_stats['num_repositories']} repositories",
     )
@@ -306,56 +483,69 @@ def build_global_summary_pages(global_stats: dict, titles: dict[str, str]) -> li
     return pages
 
 
-def _build_bar_chart_page(class_counts: Counter, titles: dict[str, str], top_n: int,
-                           chart_title: str, subtitle: str) -> plt.Figure | None:
-    if not class_counts:
-        return None
-
+def _build_bar_chart_axes(ax, class_counts: Counter, titles: dict[str, str], top_n: int, label_width: int = 32) -> None:
     top = class_counts.most_common(top_n)
     total_classified = sum(class_counts.values())
     plotted = list(reversed(top))
-    labels = [_truncate(isic_label(code, titles), 46) for code, _ in plotted]
+    labels = [_wrap_label(isic_label(code, titles), label_width) for code, _ in plotted]
     counts = [c for _, c in plotted]
     pcts = [c / total_classified * 100 for c in counts]
 
-    fig = plt.figure(figsize=PAGE_SIZE)
-    ax = fig.add_axes([0.34, 0.08, 0.60, 0.80])
     max_count = max(counts) or 1
     colors = [SEQUENTIAL_BLUE(0.25 + 0.75 * (c / max_count)) for c in counts]
-    bars = ax.barh(labels, counts, color=colors, height=0.62, zorder=3)
+    bars = ax.barh(labels, counts, color=colors, height=0.58, zorder=3)
     _style_axes(ax)
     ax.xaxis.grid(True, color=GRIDLINE, linewidth=1, zorder=0)
     ax.set_axisbelow(True)
     ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{int(v):,}"))
     ax.set_xlabel("Classified projects", fontsize=9.5)
-    ax.tick_params(axis="y", labelsize=8.5)
-    ax.tick_params(axis="x", labelsize=8.5)
+    ax.tick_params(axis="y", labelsize=8.7)
+    ax.tick_params(axis="x", labelsize=8.7)
 
     max_x = max(counts)
     for bar, count, pct in zip(bars, counts, pcts):
-        ax.text(bar.get_width() + max_x * 0.018, bar.get_y() + bar.get_height() / 2,
-                f"{count:,} ({pct:.1f}%)", va="center", ha="left", fontsize=7.8, color=INK_SECONDARY)
-    ax.set_xlim(0, max_x * 1.25)
+        ax.text(bar.get_width() + max_x * 0.02, bar.get_y() + bar.get_height() / 2,
+                f"{count:,} ({pct:.1f}%)", va="center", ha="left", fontsize=8.2, color=INK_SECONDARY)
+    ax.set_xlim(0, max_x * 1.28)
 
-    fig.text(0.5, 0.93, chart_title, fontsize=13, fontweight="bold", ha="center", color=INK_PRIMARY)
-    fig.text(0.5, 0.905, subtitle, fontsize=9, ha="center", color=INK_MUTED)
+
+def _build_bar_chart_page(class_counts: Counter, titles: dict[str, str], top_n: int,
+                           chart_title: str, subtitle: str) -> plt.Figure | None:
+    """A standalone chart page, sized to roughly 70-75% of the full previous
+    full-page chart footprint (reduced ~25-30%) while remaining vector."""
+    if not class_counts:
+        return None
+
+    fig = plt.figure(figsize=PAGE_SIZE)
+    chart_left = CONTENT_LEFT + CONTENT_WIDTH * 0.30
+    chart_width = CONTENT_RIGHT - chart_left
+    chart_height = CONTENT_HEIGHT * 0.62  # ~25-30% smaller than the prior full-content-height chart
+    chart_top = CONTENT_TOP - 0.08  # anchored just below the title/subtitle, not centered in the page
+    chart_bottom = chart_top - chart_height
+    ax = fig.add_axes([chart_left, chart_bottom, chart_width, chart_height])
+    _build_bar_chart_axes(ax, class_counts, titles, top_n, label_width=30)
+
+    fig.text(0.5, CONTENT_TOP - 0.01, chart_title, fontsize=13, fontweight="bold", ha="center", color=INK_PRIMARY)
+    fig.text(0.5, CONTENT_TOP - 0.035, subtitle, fontsize=9, ha="center", color=INK_MUTED)
     return fig
 
 
 def _build_table_and_comments_page(page_title: str, class_counts: Counter, titles: dict[str, str],
                                     top_n: int, comments: list[str]) -> plt.Figure:
     fig = plt.figure(figsize=PAGE_SIZE)
-    fig.text(0.08, 0.965, page_title, fontsize=15, fontweight="bold", color=INK_PRIMARY)
+    fig.text(CONTENT_LEFT, CONTENT_TOP, page_title, fontsize=15, fontweight="bold", va="top", color=INK_PRIMARY)
 
     total_classified = sum(class_counts.values())
     top = class_counts.most_common(top_n)
 
-    table_ax = fig.add_axes([0.08, 0.38, 0.86, 0.56])
+    table_h = CONTENT_HEIGHT * 0.74
+    table_top = CONTENT_TOP - 0.04
+    table_ax = fig.add_axes([CONTENT_LEFT, table_top - table_h, CONTENT_WIDTH, table_h])
     table_ax.axis("off")
 
     col_labels = ["Rank", "ISIC code", "ISIC division title", "Count", "%"]
     cell_text = [
-        [str(rank), code, _truncate(titles.get(code, code), 52), f"{count:,}",
+        [str(rank), code, _wrap_label(titles.get(code, code), 44), f"{count:,}",
          f"{(count / total_classified * 100) if total_classified else 0:.1f}%"]
         for rank, (code, count) in enumerate(top, start=1)
     ]
@@ -364,48 +554,64 @@ def _build_table_and_comments_page(page_title: str, class_counts: Counter, title
         colWidths=[0.08, 0.14, 0.56, 0.11, 0.11],
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(8.3)
-    table.scale(1, 1.35)
+    table.set_fontsize(7.8)
+    table.scale(1, 1.55)  # tall enough for up to 2 wrapped lines per title, without overflowing table_h
     for (row, _col), cell in table.get_celld().items():
         cell.set_edgecolor(GRIDLINE)
         if row == 0:
             cell.set_text_props(fontweight="bold", color="white")
-            cell.set_facecolor(HEADER_FILL)
+            cell.set_facecolor(BLUE_DARK)
         else:
             cell.set_facecolor(SURFACE)
 
-    comments_ax = fig.add_axes([0.08, 0.06, 0.86, 0.28])
+    comments_h = CONTENT_HEIGHT * 0.13
+    comments_ax = fig.add_axes([CONTENT_LEFT, CONTENT_BOTTOM, CONTENT_WIDTH, comments_h])
     comments_ax.axis("off")
     comments_ax.text(0.0, 1.0, "Findings", transform=comments_ax.transAxes, fontsize=11.5,
                       fontweight="bold", va="top", color=INK_PRIMARY)
-    _draw_bullets(comments_ax, 0.0, 0.88, comments, fontsize=9.7, wrap_width=100, line_spacing=0.052, bullet_gap=0.03)
+    _draw_bullets(comments_ax, 0.0, 0.80, comments, fontsize=9.3, wrap_width=104,
+                  line_spacing=_leading(comments_h, 12), bullet_gap=_leading(comments_h, 6))
     return fig
 
 
 def build_repository_pages(repo_id: int, stats: dict, titles: dict[str, str], top_n: int) -> list[plt.Figure]:
-    pages = [_build_stats_text_page(f"Repository {repo_id}", stats)]
+    fig = plt.figure(figsize=PAGE_SIZE)
+    text_h = CONTENT_HEIGHT * 0.30
+    text_ax = fig.add_axes([CONTENT_LEFT, CONTENT_TOP - text_h, CONTENT_WIDTH, text_h])
+    text_ax.axis("off")
+    text_ax.text(0.0, 0.97, f"Repository {repo_id}", transform=text_ax.transAxes, fontsize=16,
+                 fontweight="bold", va="top", color=INK_PRIMARY)
+    _draw_lines(text_ax, 0.0, 0.72, _stats_lines(stats), fontsize=10.5, line_spacing=_leading(text_h, 16))
 
-    chart = _build_bar_chart_page(
-        stats["class_counts"], titles, top_n=top_n,
-        chart_title=f"Top {min(top_n, len(stats['class_counts']))} Primary ISIC Classes — Repository {repo_id}",
-        subtitle=f"{stats['classified_count']:,} classified of {stats['total']:,} eligible projects",
-    )
-    if chart is not None:
-        pages.append(chart)
+    pages = [fig]
+    has_chart = bool(stats["class_counts"])
+    if has_chart:
+        chart_top = CONTENT_TOP - text_h - 0.03
+        chart_height = chart_top - CONTENT_BOTTOM
+        chart_left = CONTENT_LEFT + CONTENT_WIDTH * 0.32
+        chart_ax = fig.add_axes([chart_left, CONTENT_BOTTOM, CONTENT_RIGHT - chart_left, chart_height])
+        _build_bar_chart_axes(chart_ax, stats["class_counts"], titles, top_n=CHART_TOP_N, label_width=28)
+        fig.text(
+            0.5, chart_top + 0.012,
+            f"Top {min(CHART_TOP_N, len(stats['class_counts']))} Primary ISIC Classes — Repository {repo_id}",
+            fontsize=11.5, fontweight="bold", ha="center", color=INK_PRIMARY,
+        )
 
-    if stats["class_counts"]:
+    if has_chart:
         comments = generate_comments(stats, titles)
         pages.append(_build_table_and_comments_page(
             f"Repository {repo_id} — Top {min(top_n, len(stats['class_counts']))} ISIC Classes",
             stats["class_counts"], titles, top_n, comments,
         ))
     else:
-        fig, ax = _new_page()
-        ax.text(0.0, 0.9, f"Repository {repo_id} — Findings", transform=ax.transAxes,
-                fontsize=13, fontweight="bold", color=INK_PRIMARY)
+        no_data_ax = fig.add_axes([CONTENT_LEFT, CONTENT_BOTTOM, CONTENT_WIDTH, CONTENT_TOP - text_h - CONTENT_BOTTOM])
+        no_data_ax.axis("off")
+        no_data_ax.text(0.0, 1.0, "Findings", transform=no_data_ax.transAxes, fontsize=13, fontweight="bold",
+                         va="top", color=INK_PRIMARY)
         comments = generate_comments(stats, titles)
-        _draw_bullets(ax, 0.0, 0.82, comments, fontsize=10.5, wrap_width=92, line_spacing=0.03, bullet_gap=0.018)
-        pages.append(fig)
+        _draw_bullets(no_data_ax, 0.0, 0.90, comments, fontsize=10.5, wrap_width=92,
+                      line_spacing=_leading(CONTENT_TOP - text_h - CONTENT_BOTTOM, 16),
+                      bullet_gap=_leading(CONTENT_TOP - text_h - CONTENT_BOTTOM, 9))
 
     return pages
 
@@ -426,8 +632,14 @@ def build_limitations_page() -> plt.Figure:
         "Coverage figures in this report reflect the state of the production database at generation "
         "time. If production inference is still running or was interrupted, coverage may be "
         "incomplete and will increase on a subsequent run of this report.",
+        "The repository_id used to group projects in this report is assigned locally by each "
+        "contributing student's own harvesting configuration; it is not a globally unique repository "
+        "identifier, and the same numeric ID can denote different real-world source repositories "
+        "across students. Repository sections here should be read as processing groupings rather than "
+        "a canonical list of distinct external archives.",
     ]
-    _draw_bullets(ax, 0.0, 0.90, points, fontsize=10.5, wrap_width=92, line_spacing=0.03, bullet_gap=0.02)
+    _draw_bullets(ax, 0.0, 0.90, points, fontsize=10.5, wrap_width=92,
+                  line_spacing=_leading(CONTENT_HEIGHT, 15), bullet_gap=_leading(CONTENT_HEIGHT, 9))
     return fig
 
 
@@ -460,8 +672,20 @@ def generate_report(
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Build every page in memory first so the footer can print "Page X of Y"
+    # with a real total, then save them all in a second pass.
+    pages: list[plt.Figure] = []
+    pages.append(build_title_page(db_path, generated_at, global_stats, preferred_method, fallback_method))
+    pages.append(build_methodology_page(preferred_method, fallback_method))
+    pages.extend(build_global_summary_pages(global_stats, titles))
+
     repo_ids_processed: list[int] = []
-    page_count = 0
+    for repo_id in sorted(by_repo.keys()):
+        pages.extend(build_repository_pages(repo_id, by_repo[repo_id], titles, top_n))
+        repo_ids_processed.append(repo_id)
+
+    pages.append(build_limitations_page())
+    total_pages = len(pages)
 
     with tempfile.TemporaryDirectory() as _tmp_dir:
         # Any ad-hoc chart preview during generation would be written under
@@ -469,23 +693,10 @@ def generate_report(
         # are written directly (vector) into the final PdfPages output, so no
         # intermediate raster files are produced in the normal path.
         with PdfPages(out_path) as pdf:
-            def _emit(fig: plt.Figure) -> None:
-                nonlocal page_count
+            for i, fig in enumerate(pages, start=1):
+                _add_footer(fig, i, total_pages)
                 pdf.savefig(fig)
                 plt.close(fig)
-                page_count += 1
-
-            _emit(build_title_page(db_path, generated_at, global_stats))
-            _emit(build_methodology_page(preferred_method, fallback_method))
-            for page in build_global_summary_pages(global_stats, titles):
-                _emit(page)
-
-            for repo_id in sorted(by_repo.keys()):
-                for page in build_repository_pages(repo_id, by_repo[repo_id], titles, top_n):
-                    _emit(page)
-                repo_ids_processed.append(repo_id)
-
-            _emit(build_limitations_page())
 
             info = pdf.infodict()
             info["Title"] = "QDArchive Project Classification Report"
@@ -493,7 +704,7 @@ def generate_report(
 
     return {
         "output_path": out_path,
-        "page_count": page_count,
+        "page_count": total_pages,
         "repo_ids_processed": repo_ids_processed,
         "global_stats": global_stats,
         "by_repo": by_repo,
