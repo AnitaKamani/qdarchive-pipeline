@@ -249,25 +249,25 @@ def _integrity_checks(conn: sqlite3.Connection) -> dict:
 # Report writers
 # ---------------------------------------------------------------------------
 
-def _write_summary_report(metrics: list[tuple[str, object]]) -> None:
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    with open(SUMMARY_REPORT, "w", newline="", encoding="utf-8") as f:
+def _write_summary_report(metrics: list[tuple[str, object]], path: Path = SUMMARY_REPORT) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["metric", "value"])
         w.writerows(metrics)
 
 
-def _write_division_report(rows: list[dict]) -> None:
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    with open(DIVISION_REPORT, "w", newline="", encoding="utf-8") as f:
+def _write_division_report(rows: list[dict], path: Path = DIVISION_REPORT) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["rank", "code", "title", "count", "percentage"])
         w.writeheader()
         w.writerows(rows)
 
 
-def _write_confidence_report(rows_by_method: dict[str, list[dict]]) -> None:
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CONFIDENCE_REPORT, "w", newline="", encoding="utf-8") as f:
+def _write_confidence_report(rows_by_method: dict[str, list[dict]], path: Path = CONFIDENCE_REPORT) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["method", "bucket", "count", "percentage"])
         w.writeheader()
         for method, rows in rows_by_method.items():
@@ -275,10 +275,10 @@ def _write_confidence_report(rows_by_method: dict[str, list[dict]]) -> None:
                 w.writerow({"method": method, **r})
 
 
-def _write_model_stats_report(rows: list[dict]) -> None:
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+def _write_model_stats_report(rows: list[dict], path: Path = MODEL_STATS_REPORT) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = ["method", "count", "coverage_percent", "min", "max", "mean", "median", "stddev", "q1", "q3"]
-    with open(MODEL_STATS_REPORT, "w", newline="", encoding="utf-8") as f:
+    with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         w.writerows(rows)
@@ -288,8 +288,17 @@ def _write_model_stats_report(rows: list[dict]) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-def evaluate(db_path: str) -> dict:
+def evaluate(db_path: str, reports_dir: str | Path | None = None) -> dict:
+    """reports_dir overrides where the four CSVs are written; the module-level
+    defaults (reports/) are used when omitted, so existing callers (this
+    script's own CLI) are unaffected."""
     conn = _connect_readonly(db_path)
+
+    reports_path = Path(reports_dir) if reports_dir is not None else REPORTS_DIR
+    summary_path = reports_path / "isic_evaluation_summary.csv"
+    division_path = reports_path / "isic_division_distribution.csv"
+    confidence_path = reports_path / "isic_confidence_distribution.csv"
+    model_stats_path = reports_path / "isic_model_statistics.csv"
 
     total_inputs = _total_project_inputs(conn)
     method_success_counts = _method_success_counts(conn)
@@ -347,10 +356,10 @@ def evaluate(db_path: str) -> dict:
         ("orphan_project_ids", checks["orphan_project_ids"]),
     ]
 
-    _write_summary_report(summary_metrics)
-    _write_division_report(division_rows)
-    _write_confidence_report(confidence_by_method)
-    _write_model_stats_report(model_stats_rows)
+    _write_summary_report(summary_metrics, summary_path)
+    _write_division_report(division_rows, division_path)
+    _write_confidence_report(confidence_by_method, confidence_path)
+    _write_model_stats_report(model_stats_rows, model_stats_path)
 
     conn.close()
 
@@ -364,6 +373,12 @@ def evaluate(db_path: str) -> dict:
         "checks": checks,
         "division_rows": division_rows,
         "model_stats_rows": model_stats_rows,
+        "report_paths": {
+            "summary": summary_path,
+            "division": division_path,
+            "confidence": confidence_path,
+            "model_stats": model_stats_path,
+        },
     }
 
 

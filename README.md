@@ -123,3 +123,19 @@ python phase_2/run_isic_classification.py --db 23727550-sq26-combined.db --provi
 ```bash
 python phase_2/check_isic_classification.py --db 23727550-sq26-combined.db
 ```
+
+### Regenerating all outputs
+
+After running the classifier — at any later time, from any point of progress — one command regenerates every derived report and export from the current database state: evaluation CSVs, figures, both project classification XLSX tables (classified-only and full), the PDF report, and all validation CSVs.
+
+```bash
+python phase_2/regenerate_all_outputs.py --db 23727550-sq26-combined.db
+```
+
+or equivalently:
+
+```bash
+./regenerate_outputs.sh
+```
+
+This command only reads the database and rewrites files under `reports/` — it does **not** rerun model classification (no API calls are made) and does not modify the database. Run it any time you want the reports to reflect the latest classification progress. Pass `--dry-run` to see the planned stages and output paths without touching any file, or `--continue-on-error` to run every stage and report all failures at the end instead of stopping at the first one.

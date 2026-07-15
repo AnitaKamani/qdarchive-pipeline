@@ -193,9 +193,10 @@ def validate(rows: list[dict], valid_codes: set[str], preferred_method: str, fal
     return checks
 
 
-def write_validation_report(checks: list[dict]) -> None:
-    Path("reports").mkdir(parents=True, exist_ok=True)
-    with open(VALIDATION_REPORT, "w", newline="", encoding="utf-8") as f:
+def write_validation_report(checks: list[dict], path: str | Path = VALIDATION_REPORT) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["check", "status", "detail"])
         w.writeheader()
         w.writerows(checks)
@@ -207,6 +208,7 @@ def run(
     include_unclassified: bool,
     preferred_method: str,
     fallback_method: str,
+    validation_report_path: str | Path | None = None,
 ) -> tuple[list[dict], list[dict]]:
     conn = connect_readonly(db_path)
     print_schema_decisions(preferred_method, fallback_method, include_unclassified)
@@ -220,7 +222,7 @@ def run(
     print(f"Workbook written to {out_path}")
 
     checks = validate(rows, set(titles.keys()), preferred_method, fallback_method, out_path)
-    write_validation_report(checks)
+    write_validation_report(checks, validation_report_path if validation_report_path is not None else VALIDATION_REPORT)
     conn.close()
 
     return rows, checks

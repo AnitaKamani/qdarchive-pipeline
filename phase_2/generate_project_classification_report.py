@@ -760,9 +760,10 @@ def validate(result: dict, valid_codes: set[str]) -> list[dict]:
     return checks
 
 
-def write_validation_report(checks: list[dict]) -> None:
-    Path("reports").mkdir(parents=True, exist_ok=True)
-    with open(VALIDATION_REPORT, "w", newline="", encoding="utf-8") as f:
+def write_validation_report(checks: list[dict], path: str | Path = VALIDATION_REPORT) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["check", "status", "detail"])
         w.writeheader()
         w.writerows(checks)
