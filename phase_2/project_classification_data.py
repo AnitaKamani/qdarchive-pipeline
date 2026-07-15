@@ -30,6 +30,10 @@ states them before generating output):
     to "successful" files would be an arbitrary, unspecified normalization.
     The field name ("number of project files") maps most directly onto the
     full file manifest, independent of download outcome.
+  - Final-output artifacts (every caller of fetch_project_rows() and
+    coverage_counts() below) exclude any project whose combined_projects.
+    repository_id appears in EXCLUDED_REPOSITORY_IDS. This is the single,
+    shared place that exclusion is enforced; no other script re-implements it.
 """
 
 from __future__ import annotations
@@ -39,6 +43,11 @@ from pathlib import Path
 
 ELIGIBLE_PROJECT_TYPES = ("QDA_PROJECT", "QD_PROJECT")
 IGNORED_METHODS = ("local-dry-run", "model_error")
+
+# Source repositories excluded from all final-output statistics (exports,
+# reports, validations). Applied once here so every downstream artifact
+# stays consistent without a separate presentation-layer check.
+EXCLUDED_REPOSITORY_IDS = (99,)
 
 DEFAULT_PREFERRED_METHOD = "openai:gpt-4.1-mini"
 DEFAULT_FALLBACK_METHOD = "openai:gpt-4o-mini"
@@ -79,6 +88,7 @@ def print_schema_decisions(preferred_method: str, fallback_method: str, include_
     print(f"  cross-model preference : {preferred_method}, fallback {fallback_method}")
     print("  ignored methods        : " + ", ".join(IGNORED_METHODS))
     print(f"  unclassified projects  : {'included (empty classes)' if include_unclassified else 'excluded (default)'}")
+    print(f"  excluded repositories  : {len(EXCLUDED_REPOSITORY_IDS)} (fixed list; see EXCLUDED_REPOSITORY_IDS)")
 
 
 def fetch_project_rows(
@@ -100,7 +110,8 @@ def fetch_project_rows(
         ).fetchall()
     )
 
-    placeholders = ", ".join("?" for _ in ELIGIBLE_PROJECT_TYPES)
+    type_placeholders = ", ".join("?" for _ in ELIGIBLE_PROJECT_TYPES)
+    excluded_placeholders = ", ".join("?" for _ in EXCLUDED_REPOSITORY_IDS)
     query = (
         "SELECT cp.global_project_id, cp.repository_id, cp.project_type, cp.title, "
         "pref.primary_class_code, pref.secondary_class_code, "
@@ -110,10 +121,13 @@ def fetch_project_rows(
         "  ON pref.project_id = cp.global_project_id AND pref.method = ? AND pref.primary_class_code IS NOT NULL "
         "LEFT JOIN project_classifications fb "
         "  ON fb.project_id = cp.global_project_id AND fb.method = ? AND fb.primary_class_code IS NOT NULL "
-        f"WHERE cp.project_type IN ({placeholders}) "
+        f"WHERE cp.project_type IN ({type_placeholders}) "
+        f"AND cp.repository_id NOT IN ({excluded_placeholders}) "
         "ORDER BY cp.repository_id, cp.project_type, cp.title, cp.global_project_id"
     )
-    rows = conn.execute(query, (preferred_method, fallback_method, *ELIGIBLE_PROJECT_TYPES)).fetchall()
+    rows = conn.execute(
+        query, (preferred_method, fallback_method, *ELIGIBLE_PROJECT_TYPES, *EXCLUDED_REPOSITORY_IDS)
+    ).fetchall()
 
     result: list[dict] = []
     for (
@@ -148,17 +162,30 @@ def coverage_counts(conn: sqlite3.Connection, methods: tuple[str, ...]) -> tuple
     """(total, covered, remaining) eligible PROJECT inputs, where 'covered'
     means a successful project_classifications row exists under any of
     `methods`. Mirrors the resume-filtering logic used by the classifier
-    itself, so this reporting matches what the pipeline considers done."""
+    itself, so this reporting matches what the pipeline considers done.
+
+    Joins to combined_projects to apply the same EXCLUDED_REPOSITORY_IDS
+    filter as fetch_project_rows(), so coverage figures line up with the
+    final-output row selection rather than a larger unfiltered population.
+    """
+    excluded_placeholders = ", ".join("?" for _ in EXCLUDED_REPOSITORY_IDS)
     total = conn.execute(
-        "SELECT COUNT(*) FROM classification_inputs WHERE target_type = 'PROJECT'"
+        "SELECT COUNT(*) FROM classification_inputs ci "
+        "JOIN combined_projects cp ON cp.global_project_id = ci.project_id "
+        "WHERE ci.target_type = 'PROJECT' "
+        f"AND cp.repository_id NOT IN ({excluded_placeholders})",
+        EXCLUDED_REPOSITORY_IDS,
     ).fetchone()[0]
     placeholders = ", ".join("?" for _ in methods)
     remaining = conn.execute(
         "SELECT COUNT(*) FROM classification_inputs ci "
-        "WHERE ci.target_type = 'PROJECT' AND NOT EXISTS ("
+        "JOIN combined_projects cp ON cp.global_project_id = ci.project_id "
+        "WHERE ci.target_type = 'PROJECT' "
+        f"AND cp.repository_id NOT IN ({excluded_placeholders}) "
+        "AND NOT EXISTS ("
         "SELECT 1 FROM project_classifications pc "
         "WHERE pc.project_id = ci.project_id AND pc.method IN "
         f"({placeholders}))",
-        methods,
+        (*EXCLUDED_REPOSITORY_IDS, *methods),
     ).fetchone()[0]
     return total, total - remaining, remaining

@@ -35,6 +35,7 @@ import generate_project_classification_report as pdf_reporter
 from project_classification_data import (
     DEFAULT_FALLBACK_METHOD,
     DEFAULT_PREFERRED_METHOD,
+    EXCLUDED_REPOSITORY_IDS,
     connect_readonly,
     coverage_counts,
     fetch_project_rows,
@@ -96,6 +97,10 @@ def validate_selection(conn, preferred_method: str, fallback_method: str) -> lis
 
     missing_repo = sum(1 for r in rows if r["repository_id"] is None)
     add("all rows have a repository_id", missing_repo == 0, f"{missing_repo} missing")
+
+    excluded_present = sum(1 for r in rows if r["repository_id"] in EXCLUDED_REPOSITORY_IDS)
+    add("repository_id 99 absent from final outputs", excluded_present == 0,
+        "0 rows" if excluded_present == 0 else f"{excluded_present} rows present")
 
     classified_in_selection = sum(1 for r in rows if r["method_used"] is not None)
     add(

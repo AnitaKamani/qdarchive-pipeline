@@ -44,6 +44,7 @@ from openpyxl.utils import get_column_letter
 from project_classification_data import (
     DEFAULT_FALLBACK_METHOD,
     DEFAULT_PREFERRED_METHOD,
+    EXCLUDED_REPOSITORY_IDS,
     IGNORED_METHODS,
     connect_readonly,
     fetch_project_rows,
@@ -145,6 +146,10 @@ def validate(rows: list[dict], valid_codes: set[str], preferred_method: str, fal
 
     missing_repo = sum(1 for r in rows if r["repository_id"] is None or r["repository_id"] == "")
     add("all repository IDs present", missing_repo == 0, f"{missing_repo} rows with missing repository_id")
+
+    excluded_present = sum(1 for r in rows if r["repository_id"] in EXCLUDED_REPOSITORY_IDS)
+    add("repository_id 99 absent from final outputs", excluded_present == 0,
+        "0 rows" if excluded_present == 0 else f"{excluded_present} rows present")
 
     negative_files = sum(1 for r in rows if r["no_project_files"] < 0)
     add("file counts are non-negative", negative_files == 0, f"{negative_files} rows with negative no_project_files")

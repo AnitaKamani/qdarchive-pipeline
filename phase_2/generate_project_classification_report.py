@@ -15,11 +15,13 @@ production classification currently is.
 A note on "repository_id": it is assigned locally by each contributing
 student's own harvesting configuration (see config.py's REPOS list) and is
 not a globally unique identifier — the same numeric ID can denote different
-real-world source repositories across students. Repository 99 was inspected
-specifically (see project history) and found to be genuine, correctly
-classified data (a Zenodo-sourced project), not an artifact, so it is kept
-in every output like any other repository. This caveat is stated explicitly
-in the report's Limitations section rather than silently omitted.
+real-world source repositories across students. This caveat is stated
+explicitly in the report's Limitations section rather than silently omitted.
+
+A fixed set of source repositories is excluded from every final-output
+statistic in this report — see project_classification_data.EXCLUDED_REPOSITORY_IDS,
+which fetch_project_rows() applies once so this and every other final-output
+script stay consistent without a separate presentation-layer check.
 
 Usage:
     python phase_2/generate_project_classification_report.py [options]
@@ -52,6 +54,7 @@ if str(_here) not in sys.path:
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.font_manager as font_manager
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.colors import LinearSegmentedColormap
@@ -60,6 +63,7 @@ from matplotlib.ticker import FuncFormatter
 from project_classification_data import (
     DEFAULT_FALLBACK_METHOD,
     DEFAULT_PREFERRED_METHOD,
+    EXCLUDED_REPOSITORY_IDS,
     connect_readonly,
     fetch_project_rows,
     isic_label,
@@ -99,12 +103,31 @@ BLUE_DARK = "#0d366b"    # table/section headers, darkest chart bars, "classifie
 BLUE_LIGHT = "#9ec5f4"   # "remaining" pie slice, light chart bars
 SEQUENTIAL_BLUE = LinearSegmentedColormap.from_list("seq_blue", ["#cde2fb", BLUE_DARK])
 
-# Calibri is the preferred typeface; where it isn't installed, matplotlib's
-# font-family fallback chain resolves to the next available name (Helvetica,
-# then Arial, then the bundled DejaVu Sans) without raising an error. The
-# "Font family not found" notice this produces for the first (unavailable)
-# name is expected and not a fault — silence it rather than let it clutter
-# console output on every run.
+# Font selection, tried in this order and applied as a single resolved name
+# (not a fallback list) so every element — title page, headings, body text,
+# tables, chart text, footers, page numbers — renders with the exact same
+# family rather than each independently resolving its own fallback. Calibri
+# and Aptos are not distributed with macOS itself (they ship with Microsoft
+# Office/365), so on a plain macOS install this normally resolves to
+# Helvetica Neue; nothing here raises if a name is unavailable.
+FONT_FAMILY_CANDIDATES = ["Calibri", "Aptos", "Helvetica Neue", "Helvetica", "Arial", "DejaVu Sans"]
+
+
+def _resolve_font_family() -> str:
+    for name in FONT_FAMILY_CANDIDATES:
+        try:
+            font_manager.findfont(name, fallback_to_default=False)
+        except Exception:
+            continue
+        return name
+    return "DejaVu Sans"  # bundled with matplotlib; always resolves
+
+
+RESOLVED_FONT_FAMILY = _resolve_font_family()
+
+# Silence the "Font family not found" notice matplotlib would otherwise log
+# for each unavailable candidate name above _resolve_font_family() already
+# handled — not a fault, just expected fallback resolution.
 logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
 
 plt.rcParams.update({
@@ -112,7 +135,7 @@ plt.rcParams.update({
     "axes.facecolor": SURFACE,
     "savefig.facecolor": SURFACE,
     "text.color": INK_PRIMARY,
-    "font.family": ["Calibri", "Helvetica", "Arial", "DejaVu Sans"],
+    "font.family": RESOLVED_FONT_FAMILY,
     # All pages are built in memory before any is saved (so the footer can
     # print a real "Page X of Y"), so it's normal to have dozens of figures
     # open at once here — not a leak, so the default open-figure warning
@@ -139,13 +162,6 @@ def _wrap_label(text: str, width: int, max_lines: int = 2) -> str:
         last = last[: width - 1].rstrip()
     kept[-1] = last + "…"
     return "\n".join(kept)
-
-
-def _label_ink(hex_color: str) -> str:
-    """White text on a dark fill, dark ink on a light fill."""
-    r, g, b = (int(hex_color.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
-    luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
-    return "#ffffff" if luminance < 140 else INK_PRIMARY
 
 
 def _leading(axes_height_fraction: float, points: float) -> float:
@@ -191,13 +207,31 @@ def _draw_lines(ax, x: float, y: float, lines: list[str], fontsize: float = 11,
     return y
 
 
+def _wrap_paragraph_balanced(text: str, width: int) -> list[str]:
+    """Word-wrap like textwrap.wrap, but avoid leaving a short "widow" line
+    (e.g. one lone short word) at the end of a paragraph. textwrap's greedy
+    fill picks break points purely by character count, which can strand a
+    short remainder on its own final line; trying slightly narrower widths
+    that still produce the same number of lines often finds a break point
+    where the last line fills a reasonable share of the column instead."""
+    lines = textwrap.wrap(text, width=width) or [""]
+    if len(lines) <= 1 or len(lines[-1]) >= width * 0.55:
+        return lines
+    for w in range(width - 1, max(width - 12, 20), -1):
+        candidate = textwrap.wrap(text, width=w) or [""]
+        if len(candidate) == len(lines) and len(candidate[-1]) >= width * 0.55:
+            return candidate
+    return lines
+
+
 def _draw_paragraphs(ax, x: float, y: float, paragraphs: list[str], fontsize: float = 10.5,
                       wrap_width: int = 92, line_spacing: float = 0.026, para_gap: float = 0.016) -> float:
     """Word-wrap each paragraph to `wrap_width` characters (tuned for the
-    default axes width and font) and render one line per matplotlib text
-    call, so long sentences never run off the page edge."""
+    default axes width and font), rebalanced to avoid short widow lines, and
+    render one line per matplotlib text call so long sentences never run off
+    the page edge. Left-aligned throughout — never centered."""
     for para in paragraphs:
-        for line in textwrap.wrap(para, width=wrap_width) or [""]:
+        for line in _wrap_paragraph_balanced(para, wrap_width):
             ax.text(x, y, line, transform=ax.transAxes, fontsize=fontsize, color=INK_PRIMARY, va="top", ha="left")
             y -= line_spacing
         y -= para_gap
@@ -298,24 +332,21 @@ def generate_comments(stats: dict, titles: dict[str, str]) -> list[str]:
 # Page builders
 # ---------------------------------------------------------------------------
 
-def build_title_page(db_path: str, generated_at: str, global_stats: dict,
-                      preferred_method: str, fallback_method: str) -> plt.Figure:
-    """Title block plus a compact executive-summary table sharing the same
-    page, so the report leads with the key figures without a near-empty page."""
+def build_title_page(db_path: str, generated_at: str, global_stats: dict) -> plt.Figure:
+    """Title, author/supervisor/date metadata, and the top-line population
+    figure. The numeric summary lives on the Global Summary page instead of
+    a separate executive-summary page."""
     fig = plt.figure(figsize=PAGE_SIZE)
+    ax = fig.add_axes([CONTENT_LEFT, CONTENT_BOTTOM, CONTENT_WIDTH, CONTENT_HEIGHT])
+    ax.axis("off")
 
-    title_h = CONTENT_HEIGHT * 0.46
-    title_ax = fig.add_axes([CONTENT_LEFT, CONTENT_TOP - title_h, CONTENT_WIDTH, title_h])
-    title_ax.axis("off")
-
-    rounded_thousands = (global_stats["total"] // 1000) * 1000
     lines_top = [
-        (0.86, "QDArchive Project Classification Report", 20, "bold", INK_PRIMARY),
-        (0.76, "ISIC Rev. 5 classification of QDA/QD projects", 12.5, "normal", INK_SECONDARY),
+        (0.88, "QDArchive Project Classification Report", 22, "bold", INK_PRIMARY),
+        (0.815, "ISIC Rev. 5 classification of QDA/QD projects", 13, "normal", INK_SECONDARY),
     ]
     for y, text, fontsize, weight, color in lines_top:
-        title_ax.text(0.5, y, text, transform=title_ax.transAxes, fontsize=fontsize, fontweight=weight,
-                       ha="center", color=color)
+        ax.text(0.5, y, text, transform=ax.transAxes, fontsize=fontsize, fontweight=weight,
+                ha="center", color=color)
 
     meta_lines = [
         f"Author: {AUTHOR}",
@@ -326,53 +357,19 @@ def build_title_page(db_path: str, generated_at: str, global_stats: dict,
         f"Database: {Path(db_path).name}",
         f"Generated: {generated_at}",
     ]
-    y = 0.60
+    y = 0.62
     for line in meta_lines:
         if line:
-            title_ax.text(0.5, y, line, transform=title_ax.transAxes, fontsize=11, ha="center", color=INK_SECONDARY)
-        y -= 0.075
+            ax.text(0.5, y, line, transform=ax.transAxes, fontsize=11.5, ha="center", color=INK_SECONDARY)
+        y -= 0.045
 
-    title_ax.text(
-        0.5, 0.04,
+    rounded_thousands = (global_stats["total"] // 1000) * 1000
+    ax.text(
+        0.5, 0.18,
         f"More than {rounded_thousands:,} eligible projects across "
         f"{global_stats['num_repositories']} successfully processed repositories",
-        transform=title_ax.transAxes, fontsize=10.5, ha="center", color=INK_MUTED,
+        transform=ax.transAxes, fontsize=11, ha="center", color=INK_MUTED,
     )
-
-    # --- Executive summary table, sharing the page rather than a near-empty one ---
-    summary_h = CONTENT_HEIGHT * 0.30
-    summary_top = CONTENT_TOP - title_h - CONTENT_HEIGHT * 0.06
-    heading_ax = fig.add_axes([CONTENT_LEFT, summary_top - 0.03, CONTENT_WIDTH, 0.03])
-    heading_ax.axis("off")
-    heading_ax.text(0.0, 1.0, "Executive Summary", transform=heading_ax.transAxes, fontsize=14,
-                     fontweight="bold", va="top", color=INK_PRIMARY)
-
-    table_ax = fig.add_axes([CONTENT_LEFT, summary_top - 0.06 - summary_h, CONTENT_WIDTH, summary_h])
-    table_ax.axis("off")
-
-    coverage_pct = (global_stats["classified_count"] / global_stats["total"] * 100) if global_stats["total"] else 0.0
-    rows = [
-        ["Eligible projects", f"{global_stats['total']:,}"],
-        ["Classified projects", f"{global_stats['classified_count']:,}"],
-        ["Coverage", f"{coverage_pct:.1f}%"],
-        ["Successfully processed repositories", f"{global_stats['num_repositories']}"],
-        ["Primary classification models", f"{preferred_method} (preferred), {fallback_method} (fallback)"],
-    ]
-    table = table_ax.table(
-        cellText=rows, colLabels=["Metric", "Value"], loc="upper center", cellLoc="left",
-        colWidths=[0.45, 0.55],
-    )
-    table.auto_set_font_size(False)
-    table.set_fontsize(9.5)
-    table.scale(1, 1.9)
-    for (row, _col), cell in table.get_celld().items():
-        cell.set_edgecolor(GRIDLINE)
-        if row == 0:
-            cell.set_text_props(fontweight="bold", color="white")
-            cell.set_facecolor(BLUE_DARK)
-        else:
-            cell.set_facecolor(SURFACE)
-
     return fig
 
 
@@ -424,32 +421,42 @@ def _stats_lines(stats: dict, extra_lines: list[str] | None = None) -> list[str]
     return lines
 
 
-def _build_pie_chart(ax, classified: int, unclassified: int) -> None:
-    total = classified + unclassified
-    ax.set_title("Classified vs Remaining", fontsize=11.5, fontweight="bold", color=INK_PRIMARY, pad=10)
+def _build_project_type_pie_chart(ax, type_counts: Counter) -> None:
+    """QD_PROJECT vs QDA_PROJECT share of the full eligible population.
+    Deliberately not classified-vs-remaining: that split changes as
+    production classification proceeds and is expected to reach 100%
+    coverage, whereas the project-type split is a stable property of the
+    eligible population itself."""
+    order = ["QDA_PROJECT", "QD_PROJECT"]
+    ax.set_title("Eligible Projects by Project Type", fontsize=11.5, fontweight="bold", color=INK_PRIMARY, pad=10)
+
+    present = [(t, type_counts.get(t, 0)) for t in order if type_counts.get(t, 0) > 0]
+    total = sum(c for _, c in present)
     if total == 0:
         ax.axis("off")
         ax.text(0.5, 0.5, "No eligible projects.", ha="center", va="center", transform=ax.transAxes, color=INK_MUTED)
         return
 
-    values = [classified, unclassified]
-    colors = [BLUE_DARK, BLUE_LIGHT]
-    wedges, _texts, autotexts = ax.pie(
+    values = [c for _, c in present]
+    colors = [BLUE_DARK, BLUE_LIGHT][: len(present)]
+    # Percentages are shown in the legend rather than as in-wedge autopct
+    # labels: with a split this lopsided (QDA_PROJECT is ~1% of the total),
+    # an in-wedge label has no room to sit inside its own sliver and either
+    # overlaps the neighboring wedge or renders unreadably off-center.
+    wedges, _texts = ax.pie(
         values, colors=colors, startangle=90, counterclock=False,
-        autopct=lambda pct: f"{pct:.1f}%",
-        pctdistance=0.7, wedgeprops={"edgecolor": SURFACE, "linewidth": 2},
-        textprops={"fontsize": 9.5, "fontweight": "bold"},
+        wedgeprops={"edgecolor": SURFACE, "linewidth": 2},
     )
-    for at, color in zip(autotexts, colors):
-        at.set_color(_label_ink(color))
+    legend_labels = [f"{t} ({c:,}, {c / total * 100:.1f}%)" for t, c in present]
     ax.legend(
-        wedges, [f"Classified ({classified:,})", f"Remaining ({unclassified:,})"],
+        wedges, legend_labels,
         loc="upper center", bbox_to_anchor=(0.5, -0.02), ncol=1, frameon=False, fontsize=8.8,
     )
     ax.set_aspect("equal")
 
 
-def build_global_summary_pages(global_stats: dict, titles: dict[str, str]) -> list[plt.Figure]:
+def build_global_summary_pages(global_stats: dict, titles: dict[str, str],
+                                preferred_method: str, fallback_method: str) -> list[plt.Figure]:
     fig = plt.figure(figsize=PAGE_SIZE)
     head_h = 0.05
     head_ax = fig.add_axes([CONTENT_LEFT, CONTENT_TOP - head_h, CONTENT_WIDTH, head_h])
@@ -462,14 +469,20 @@ def build_global_summary_pages(global_stats: dict, titles: dict[str, str]) -> li
     stats_w = CONTENT_WIDTH * 0.56
     stats_ax = fig.add_axes([CONTENT_LEFT, body_top - body_h, stats_w, body_h])
     stats_ax.axis("off")
-    extra = [f"Distinct ISIC classes observed: {len(global_stats['class_counts'])}"] if global_stats["class_counts"] else []
+    extra = []
+    if global_stats["class_counts"]:
+        extra.append(f"Distinct ISIC classes observed: {len(global_stats['class_counts'])}")
+    extra.append(f"Successfully processed repositories: {global_stats['num_repositories']}")
+    extra.append("Production models:")
+    extra.append(f"  {preferred_method} (preferred)")
+    extra.append(f"  {fallback_method} (fallback)")
     lines = _stats_lines(global_stats, extra_lines=extra)
     _draw_lines(stats_ax, 0.0, 0.97, lines, fontsize=11, line_spacing=_leading(body_h, 20))
 
     pie_w = CONTENT_WIDTH * 0.38
     pie_left = CONTENT_LEFT + CONTENT_WIDTH * 0.62
     pie_ax = fig.add_axes([pie_left, body_top - body_h * 0.62, pie_w, body_h * 0.55])
-    _build_pie_chart(pie_ax, global_stats["classified_count"], global_stats["unclassified_count"])
+    _build_project_type_pie_chart(pie_ax, global_stats["type_counts"])
 
     pages = [fig]
     chart = _build_bar_chart_page(
@@ -530,17 +543,25 @@ def _build_bar_chart_page(class_counts: Counter, titles: dict[str, str], top_n: 
     return fig
 
 
+# Modest, consistent gap between the bottom of a repository table and its
+# Findings heading, expressed as a page-relative fraction (see _leading).
+FINDINGS_GAP = 14  # points
+
+
 def _build_table_and_comments_page(page_title: str, class_counts: Counter, titles: dict[str, str],
-                                    top_n: int, comments: list[str]) -> plt.Figure:
+                                    top_n: int, comments: list[str]) -> list[plt.Figure]:
+    """Table and Findings are flowed as one unit: the table renders at its
+    natural content height (not stretched to fill a fixed box), Findings is
+    placed directly beneath it with a small fixed gap, and only spills to a
+    second page if it genuinely would not fit below the table."""
     fig = plt.figure(figsize=PAGE_SIZE)
     fig.text(CONTENT_LEFT, CONTENT_TOP, page_title, fontsize=15, fontweight="bold", va="top", color=INK_PRIMARY)
 
     total_classified = sum(class_counts.values())
     top = class_counts.most_common(top_n)
 
-    table_h = CONTENT_HEIGHT * 0.74
     table_top = CONTENT_TOP - 0.04
-    table_ax = fig.add_axes([CONTENT_LEFT, table_top - table_h, CONTENT_WIDTH, table_h])
+    table_ax = fig.add_axes([CONTENT_LEFT, CONTENT_BOTTOM, CONTENT_WIDTH, table_top - CONTENT_BOTTOM])
     table_ax.axis("off")
 
     col_labels = ["Rank", "ISIC code", "ISIC division title", "Count", "%"]
@@ -555,7 +576,7 @@ def _build_table_and_comments_page(page_title: str, class_counts: Counter, title
     )
     table.auto_set_font_size(False)
     table.set_fontsize(7.8)
-    table.scale(1, 1.55)  # tall enough for up to 2 wrapped lines per title, without overflowing table_h
+    table.scale(1, 1.55)  # tall enough for up to 2 wrapped lines per title
     for (row, _col), cell in table.get_celld().items():
         cell.set_edgecolor(GRIDLINE)
         if row == 0:
@@ -564,14 +585,48 @@ def _build_table_and_comments_page(page_title: str, class_counts: Counter, title
         else:
             cell.set_facecolor(SURFACE)
 
-    comments_h = CONTENT_HEIGHT * 0.13
-    comments_ax = fig.add_axes([CONTENT_LEFT, CONTENT_BOTTOM, CONTENT_WIDTH, comments_h])
-    comments_ax.axis("off")
-    comments_ax.text(0.0, 1.0, "Findings", transform=comments_ax.transAxes, fontsize=11.5,
+    # The table sizes itself to its actual content (rows x scale), anchored
+    # to the top of table_ax — measure where its real bottom edge landed so
+    # Findings can start right below it instead of at a guessed fixed offset.
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    table_bottom_fig_y = table.get_window_extent(renderer).y0 / fig.bbox.height
+
+    gap = _leading(1.0, FINDINGS_GAP)
+    findings_top = table_bottom_fig_y - gap
+    findings_height = findings_top - CONTENT_BOTTOM
+
+    fits = False
+    comments_ax = None
+    if findings_height > 0.05:
+        comments_ax = fig.add_axes([CONTENT_LEFT, CONTENT_BOTTOM, CONTENT_WIDTH, findings_height])
+        comments_ax.axis("off")
+        comments_ax.text(0.0, 1.0, "Findings", transform=comments_ax.transAxes, fontsize=11.5,
+                          fontweight="bold", va="top", color=INK_PRIMARY)
+        # The heading-to-bullet gap must stay a small fixed physical size
+        # regardless of how tall this axes happens to be (a short table
+        # leaves a much taller findings_height than a full one) — computed
+        # via _leading against this axes' own height, not a fixed fraction
+        # of it, which would otherwise stretch into a large blank gap here.
+        bullets_start_y = 1.0 - _leading(findings_height, 18)
+        end_y = _draw_bullets(comments_ax, 0.0, bullets_start_y, comments, fontsize=9.3, wrap_width=104,
+                              line_spacing=_leading(findings_height, 12), bullet_gap=_leading(findings_height, 6))
+        fits = end_y >= -0.02
+
+    if fits:
+        return [fig]
+
+    # Findings genuinely doesn't fit below the table on this page: keep its
+    # heading and bullets together as a unit on a fresh page instead of
+    # letting them straddle the boundary.
+    if comments_ax is not None:
+        comments_ax.remove()
+    findings_fig, findings_ax = _new_page()
+    findings_ax.text(0.0, 0.98, "Findings", transform=findings_ax.transAxes, fontsize=15,
                       fontweight="bold", va="top", color=INK_PRIMARY)
-    _draw_bullets(comments_ax, 0.0, 0.80, comments, fontsize=9.3, wrap_width=104,
-                  line_spacing=_leading(comments_h, 12), bullet_gap=_leading(comments_h, 6))
-    return fig
+    _draw_bullets(findings_ax, 0.0, 0.90, comments, fontsize=10.5, wrap_width=92,
+                  line_spacing=_leading(CONTENT_HEIGHT, 15), bullet_gap=_leading(CONTENT_HEIGHT, 9))
+    return [fig, findings_fig]
 
 
 def build_repository_pages(repo_id: int, stats: dict, titles: dict[str, str], top_n: int) -> list[plt.Figure]:
@@ -599,7 +654,7 @@ def build_repository_pages(repo_id: int, stats: dict, titles: dict[str, str], to
 
     if has_chart:
         comments = generate_comments(stats, titles)
-        pages.append(_build_table_and_comments_page(
+        pages.extend(_build_table_and_comments_page(
             f"Repository {repo_id} — Top {min(top_n, len(stats['class_counts']))} ISIC Classes",
             stats["class_counts"], titles, top_n, comments,
         ))
@@ -657,6 +712,7 @@ def generate_report(
     conn = connect_readonly(db_path)
     print_schema_decisions(preferred_method, fallback_method, include_unclassified=True)
     print("(the PDF report always covers the full eligible population, classified or not)")
+    print(f"Font family: {RESOLVED_FONT_FAMILY}")
 
     titles = load_isic_titles(conn)
     rows = fetch_project_rows(
@@ -675,9 +731,9 @@ def generate_report(
     # Build every page in memory first so the footer can print "Page X of Y"
     # with a real total, then save them all in a second pass.
     pages: list[plt.Figure] = []
-    pages.append(build_title_page(db_path, generated_at, global_stats, preferred_method, fallback_method))
+    pages.append(build_title_page(db_path, generated_at, global_stats))
     pages.append(build_methodology_page(preferred_method, fallback_method))
-    pages.extend(build_global_summary_pages(global_stats, titles))
+    pages.extend(build_global_summary_pages(global_stats, titles, preferred_method, fallback_method))
 
     repo_ids_processed: list[int] = []
     for repo_id in sorted(by_repo.keys()):
@@ -755,6 +811,13 @@ def validate(result: dict, valid_codes: set[str]) -> list[dict]:
         "per-repository totals sum to the global total",
         total_from_repos == result["global_stats"]["total"],
         f"{total_from_repos:,} vs {result['global_stats']['total']:,}",
+    )
+
+    excluded_present = set(result["by_repo"].keys()) & set(EXCLUDED_REPOSITORY_IDS)
+    add(
+        "repository_id 99 absent from final outputs",
+        len(excluded_present) == 0,
+        "0 rows" if not excluded_present else f"{len(excluded_present)} rows present",
     )
 
     return checks
