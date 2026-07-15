@@ -103,45 +103,103 @@ BLUE_DARK = "#0d366b"    # table/section headers, darkest chart bars, "classifie
 BLUE_LIGHT = "#9ec5f4"   # "remaining" pie slice, light chart bars
 SEQUENTIAL_BLUE = LinearSegmentedColormap.from_list("seq_blue", ["#cde2fb", BLUE_DARK])
 
-# Font selection, tried in this order and applied as a single resolved name
-# (not a fallback list) so every element — title page, headings, body text,
-# tables, chart text, footers, page numbers — renders with the exact same
-# family rather than each independently resolving its own fallback. Calibri
-# and Aptos are not distributed with macOS itself (they ship with Microsoft
-# Office/365), so on a plain macOS install this normally resolves to
-# Helvetica Neue; nothing here raises if a name is unavailable.
-FONT_FAMILY_CANDIDATES = ["Calibri", "Aptos", "Helvetica Neue", "Helvetica", "Arial", "DejaVu Sans"]
+# Font selection: one shared resolver, one shared result, consumed by every
+# text-producing part of this file (title page, headings, body text, tables,
+# chart text, footers, page numbers) so nothing independently re-resolves its
+# own fallback. Calibri and Aptos ship with Microsoft Office/365, not with
+# plain macOS, so on a stock Mac this normally resolves to Helvetica Neue;
+# nothing here raises if a preferred name isn't installed.
+FONT_FAMILY_CANDIDATES = ["Calibri", "Aptos", "Helvetica Neue", "Helvetica"]
 
 
-def _resolve_font_family() -> str:
+def _best_variant_entry(entries: list, want_italic: bool, want_bold: bool):
+    """Pick the installed face closest to the requested weight/style out of
+    every face matplotlib's font manager found for one family (a .ttc/.ttf
+    can bundle several weights as separate faces)."""
+    target_weight = 700 if want_bold else 400
+    candidates = [e for e in entries if (e.style == "italic") == want_italic]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda e: abs((e.weight if isinstance(e.weight, (int, float)) else 400) - target_weight))
+
+
+def _find_font_variants(family: str) -> dict[str, str] | None:
+    """Locate actual font FILES on this machine for `family`'s regular, bold,
+    italic, and bold-italic faces, using matplotlib's font manager index
+    (which itself scans the standard macOS font directories: /System/Library/
+    Fonts, /Library/Fonts, ~/Library/Fonts). Returns None if the family isn't
+    installed at all; falls back to the regular face for any single missing
+    style variant rather than failing."""
+    entries = [f for f in font_manager.fontManager.ttflist if f.name == family]
+    if not entries:
+        return None
+    regular = _best_variant_entry(entries, want_italic=False, want_bold=False)
+    if regular is None:
+        return None
+    bold = _best_variant_entry(entries, want_italic=False, want_bold=True) or regular
+    italic = _best_variant_entry(entries, want_italic=True, want_bold=False) or regular
+    bold_italic = _best_variant_entry(entries, want_italic=True, want_bold=True) or bold or italic or regular
+    return {"regular": regular.fname, "bold": bold.fname, "italic": italic.fname, "bolditalic": bold_italic.fname}
+
+
+def _resolve_font() -> tuple[str, dict[str, str]]:
+    """The one shared resolver: walks FONT_FAMILY_CANDIDATES in order and
+    returns the first family with real font files installed, plus the file
+    paths for each of its four style variants. If none of the preferred
+    external fonts are installed, falls back to DejaVu Sans — matplotlib's
+    own bundled font, always present with no system dependency, playing the
+    same role here that ReportLab's built-in base-14 Helvetica would in a
+    ReportLab pipeline."""
     for name in FONT_FAMILY_CANDIDATES:
-        try:
-            font_manager.findfont(name, fallback_to_default=False)
-        except Exception:
-            continue
-        return name
-    return "DejaVu Sans"  # bundled with matplotlib; always resolves
+        variants = _find_font_variants(name)
+        if variants is not None:
+            return name, variants
+    return "DejaVu Sans", _find_font_variants("DejaVu Sans") or {}
 
 
-RESOLVED_FONT_FAMILY = _resolve_font_family()
+RESOLVED_FONT_FAMILY, RESOLVED_FONT_VARIANTS = _resolve_font()
+
+# Explicitly (re-)register each resolved variant file with matplotlib's font
+# manager. These are typically already auto-discovered (that's how
+# _find_font_variants located them), but registering them by path here is
+# idempotent and makes the dependency on these specific files explicit rather
+# than incidental.
+for _variant_path in set(RESOLVED_FONT_VARIANTS.values()):
+    font_manager.fontManager.addfont(_variant_path)
 
 # Silence the "Font family not found" notice matplotlib would otherwise log
-# for each unavailable candidate name above _resolve_font_family() already
-# handled — not a fault, just expected fallback resolution.
+# for each unavailable candidate name _resolve_font() already handled above —
+# not a fault, just expected fallback resolution.
 logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
 
-plt.rcParams.update({
+# Applied via plt.rc_context(REPORT_RC) around page building/saving in
+# generate_report() rather than a bare plt.rcParams.update() at import time.
+# plt.rcParams is process-global mutable state shared with every other
+# matplotlib-using module in this pipeline (e.g. plot_isic_evaluation.py sets
+# its own font.family for its own charts); when regenerate_all_outputs.py
+# imports both, whichever import happens to run last would otherwise win and
+# silently override this module's font for the rest of the process. A scoped
+# rc_context sidesteps import order entirely: this module's settings apply
+# only while it is actually building and saving its own pages, and are
+# restored afterward regardless of what else runs before or after it.
+REPORT_RC = {
     "figure.facecolor": SURFACE,
     "axes.facecolor": SURFACE,
     "savefig.facecolor": SURFACE,
     "text.color": INK_PRIMARY,
     "font.family": RESOLVED_FONT_FAMILY,
+    # Embed real TrueType font programs (each referenced by its actual
+    # PostScript/family name in the PDF's font resources) instead of
+    # matplotlib's default Type 3 bitmap-outline fonts, which have no
+    # meaningful family name to verify — this is what makes the "is the
+    # resolved family actually embedded" validation check possible at all.
+    "pdf.fonttype": 42,
     # All pages are built in memory before any is saved (so the footer can
     # print a real "Page X of Y"), so it's normal to have dozens of figures
     # open at once here — not a leak, so the default open-figure warning
     # would just be noise on every run.
     "figure.max_open_warning": 0,
-})
+}
 
 
 # ---------------------------------------------------------------------------
@@ -350,12 +408,10 @@ def build_title_page(db_path: str, generated_at: str, global_stats: dict) -> plt
 
     meta_lines = [
         f"Author: {AUTHOR}",
+        f"Student ID: {STUDENT_ID}",
+        "",
         f"Supervisor: {SUPERVISOR}",
         f"Date: {REPORT_DATE}",
-        "",
-        f"Student ID: {STUDENT_ID}",
-        f"Database: {Path(db_path).name}",
-        f"Generated: {generated_at}",
     ]
     y = 0.62
     for line in meta_lines:
@@ -713,6 +769,10 @@ def generate_report(
     print_schema_decisions(preferred_method, fallback_method, include_unclassified=True)
     print("(the PDF report always covers the full eligible population, classified or not)")
     print(f"Font family: {RESOLVED_FONT_FAMILY}")
+    for _variant_name in ("regular", "bold", "italic", "bolditalic"):
+        _variant_file = RESOLVED_FONT_VARIANTS.get(_variant_name)
+        if _variant_file:
+            print(f"  {_variant_name:<10}: {_variant_file}")
 
     titles = load_isic_titles(conn)
     rows = fetch_project_rows(
@@ -728,35 +788,41 @@ def generate_report(
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Build every page in memory first so the footer can print "Page X of Y"
-    # with a real total, then save them all in a second pass.
-    pages: list[plt.Figure] = []
-    pages.append(build_title_page(db_path, generated_at, global_stats))
-    pages.append(build_methodology_page(preferred_method, fallback_method))
-    pages.extend(build_global_summary_pages(global_stats, titles, preferred_method, fallback_method))
+    # Scoped for the whole build+save pass (not just rcParams.update() at
+    # import time) so this module's font/style settings win regardless of
+    # what other matplotlib-using modules import before or after it — see
+    # REPORT_RC's comment above.
+    with plt.rc_context(REPORT_RC):
+        # Build every page in memory first so the footer can print
+        # "Page X of Y" with a real total, then save them all in a second pass.
+        pages: list[plt.Figure] = []
+        pages.append(build_title_page(db_path, generated_at, global_stats))
+        pages.append(build_methodology_page(preferred_method, fallback_method))
+        pages.extend(build_global_summary_pages(global_stats, titles, preferred_method, fallback_method))
 
-    repo_ids_processed: list[int] = []
-    for repo_id in sorted(by_repo.keys()):
-        pages.extend(build_repository_pages(repo_id, by_repo[repo_id], titles, top_n))
-        repo_ids_processed.append(repo_id)
+        repo_ids_processed: list[int] = []
+        for repo_id in sorted(by_repo.keys()):
+            pages.extend(build_repository_pages(repo_id, by_repo[repo_id], titles, top_n))
+            repo_ids_processed.append(repo_id)
 
-    pages.append(build_limitations_page())
-    total_pages = len(pages)
+        pages.append(build_limitations_page())
+        total_pages = len(pages)
 
-    with tempfile.TemporaryDirectory() as _tmp_dir:
-        # Any ad-hoc chart preview during generation would be written under
-        # _tmp_dir and discarded when this block exits; the PDF pages below
-        # are written directly (vector) into the final PdfPages output, so no
-        # intermediate raster files are produced in the normal path.
-        with PdfPages(out_path) as pdf:
-            for i, fig in enumerate(pages, start=1):
-                _add_footer(fig, i, total_pages)
-                pdf.savefig(fig)
-                plt.close(fig)
+        with tempfile.TemporaryDirectory() as _tmp_dir:
+            # Any ad-hoc chart preview during generation would be written
+            # under _tmp_dir and discarded when this block exits; the PDF
+            # pages below are written directly (vector) into the final
+            # PdfPages output, so no intermediate raster files are produced
+            # in the normal path.
+            with PdfPages(out_path) as pdf:
+                for i, fig in enumerate(pages, start=1):
+                    _add_footer(fig, i, total_pages)
+                    pdf.savefig(fig)
+                    plt.close(fig)
 
-            info = pdf.infodict()
-            info["Title"] = "QDArchive Project Classification Report"
-            info["Subject"] = f"Student {STUDENT_ID} — ISIC Rev. 5 classification statistics"
+                info = pdf.infodict()
+                info["Title"] = "QDArchive Project Classification Report"
+                info["Subject"] = f"Student {STUDENT_ID} — ISIC Rev. 5 classification statistics"
 
     return {
         "output_path": out_path,
@@ -766,6 +832,36 @@ def generate_report(
         "by_repo": by_repo,
         "titles": titles,
     }
+
+
+def _pdf_font_resource_names(path: Path) -> set[str]:
+    """The /BaseFont name of every font resource referenced across every
+    page of the saved PDF (subset tag prefixes like 'ABCDEF+' stripped).
+    With pdf.fonttype=42 these are the font's real PostScript/family names
+    rather than matplotlib's generic Type 3 placeholder names, so this is
+    what lets validate() confirm the resolved family was actually embedded
+    rather than merely applied in memory."""
+    from pypdf import PdfReader
+
+    names: set[str] = set()
+    reader = PdfReader(str(path))
+    for page in reader.pages:
+        resources = page.get("/Resources")
+        if not resources:
+            continue
+        fonts = resources.get("/Font")
+        if not fonts:
+            continue
+        for font_ref in fonts.values():
+            font_obj = font_ref.get_object()
+            base_font = font_obj.get("/BaseFont")
+            if not base_font:
+                continue
+            name = str(base_font).lstrip("/")
+            if "+" in name and name.split("+", 1)[0].isalnum() and len(name.split("+", 1)[0]) == 6:
+                name = name.split("+", 1)[1]
+            names.add(name)
+    return names
 
 
 def validate(result: dict, valid_codes: set[str]) -> list[dict]:
@@ -791,6 +887,18 @@ def validate(result: dict, valid_codes: set[str]) -> list[dict]:
     if actual_pages is not None:
         add("page count matches generated pages", actual_pages == result["page_count"],
             f"{actual_pages} in file vs {result['page_count']} generated")
+
+    try:
+        font_names = _pdf_font_resource_names(out_path)
+        normalized_target = RESOLVED_FONT_FAMILY.replace(" ", "").lower()
+        matched = {n for n in font_names if normalized_target in n.replace(" ", "").replace("-", "").lower()}
+        add(
+            "resolved font family is embedded/referenced in the PDF",
+            len(matched) > 0,
+            f"looked for '{RESOLVED_FONT_FAMILY}' among embedded fonts: {sorted(font_names)}",
+        )
+    except Exception as exc:  # defensive: validation must not crash the run
+        add("resolved font family is embedded/referenced in the PDF", False, str(exc))
 
     expected_repos = set(result["by_repo"].keys())
     add(
