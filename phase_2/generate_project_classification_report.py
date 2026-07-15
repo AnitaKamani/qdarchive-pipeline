@@ -407,11 +407,12 @@ def build_title_page(db_path: str, generated_at: str, global_stats: dict) -> plt
                 ha="center", color=color)
 
     meta_lines = [
-        f"Author: {AUTHOR}",
-        f"Student ID: {STUDENT_ID}",
+        f"{AUTHOR}",
+        f"Matrikelnummer: {STUDENT_ID}",
+        "",
         "",
         f"Supervisor: {SUPERVISOR}",
-        f"Date: {REPORT_DATE}",
+        f"{REPORT_DATE}",
     ]
     y = 0.62
     for line in meta_lines:
