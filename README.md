@@ -1,141 +1,167 @@
 # qdarchive-pipeline
 
-Pipeline for acquiring and structuring open qualitative research data for QDArchive. Crawls public repositories using OAI-PMH and Dataverse APIs, harvests project metadata into a normalized SQLite database, and optionally downloads associated files.
+A two-phase pipeline for building the QDArchive research-data catalogue. Phase 1
+harvests project metadata from open research-data repositories (OAI-PMH and
+Dataverse APIs), normalizes it into a SQLite database, optionally downloads
+associated files, and classifies each project as `QDA_PROJECT`, `QD_PROJECT`,
+`OTHER_PROJECT`, or `NOT_A_PROJECT` by file-extension/keyword rules. Phase 2
+merges per-student databases, classifies eligible projects into ISIC Rev. 5
+divisions using OpenAI models, validates and evaluates the results, and
+generates the final PDF/XLSX/CSV deliverables.
 
-## Repositories
+## Features
 
-| ID | Repository | Type |
-|----|-----------|------|
-| 16 | opendata.uni-halle.de | OAI-PMH |
-| 5  | ssh.datastations.nl (DANS) | Dataverse |
+- OAI-PMH and Dataverse repository harvesting
+- SQLite metadata normalization
+- Rule-based project-type classification (Phase 1)
+- ISIC Rev. 5 division classification via OpenAI (Phase 2)
+- Asynchronous OpenAI inference with adaptive concurrency
+- Automatic retry handling on transient API errors
+- Cross-model resume (skips projects already classified by an accepted model)
+- Evaluation reports and charts
+- PDF report and XLSX table deliverables
 
-## Setup
+## Repository Support
+
+Repositories are registered in [config.py](config.py)'s `REPOS` list, not
+hardcoded. Each entry specifies a `repo_id`, a connector `type` (`oai` or
+`dataverse`), a base URL, and a local download folder; `harvest.py` dispatches
+each entry to the matching connector in its `HARVESTER_MAP`. Any number of
+repositories exposing an OAI-PMH or Dataverse API can be added this way
+without touching the harvesting code itself.
+
+## Installation
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # then fill in your tokens
+cp .env.example .env   # then add your API tokens
 ```
 
-## Configuration
+## Pipeline
 
-Edit [config.py](config.py) to add keywords, file extensions, or new repositories.
-
-**API tokens** go in `.env` (never commit this file):
+**Phase 1** (per student)
 
 ```
-DANS_API_TOKEN=your-token-here
+Harvest → Normalize → Project-type classification → Per-student SQLite database
 ```
 
-Get your DANS token: log in at ssh.datastations.nl → account menu → API Token.
+**Phase 2** (combined)
 
-## Usage
+```
+Merge student databases → Classification preparation → OpenAI ISIC classification
+  → Validation → Evaluation → PDF / XLSX / Google Form outputs
+```
+
+## Main Commands
+
+### Harvest
 
 ```bash
 python harvest.py
 ```
 
-You will be prompted for:
-1. Which repos to harvest (Enter = all)
-2. Truncate database first?
-3. Max results per repo (Enter = no limit)
-4. Download files? (if yes: max file size in MB)
-5. Output mode: `bar` (default) shows a tqdm progress bar; `detail` shows per-item verbose output
+Interactive prompts: which repos to harvest (Enter = all), whether to
+truncate the database first, max results per repo (Enter = no limit),
+whether to download files (and max file size), and output mode
+(`bar` = progress bar, `detail` = verbose per-item output).
 
-## Database
-
-SQLite file: `<student_id>-<seeding_db>.db` (configured in `config.py`) — 5 tables, 1 view:
-
-| Table | Description |
-|-------|-------------|
-| `projects` | Harvested dataset metadata |
-| `files` | File listings with URL, size, and download status |
-| `keywords` | Subject keywords per project |
-| `person_role` | Authors, uploaders, contributors |
-| `licenses` | License info per project |
-
-| View | Description |
-|------|-------------|
-| `v_files` | Files joined with project URL, repo ID, size in MB, and download date |
-
-File download statuses: `SUCCEEDED`, `NOT_ATTEMPTED`, `FAILED_LOGIN_REQUIRED`, `FAILED_TOO_LARGE`, `FAILED_SERVER_UNRESPONSIVE`
-
-> **Truncate** — choosing "Truncate database" at startup deletes the `.db` file entirely and recreates it from scratch, including all tables and views.
-
-## Downloads
-
-Files are saved locally to:
-
-```
-downloads/<repo_folder>/<project_folder>/<filename>
-```
-
-The downloaded files referenced in [23727550-sq26.db](https://github.com/AnitaKamani/qdarchive-pipeline/blob/main/23727550-sq26.db) have been uploaded to [Google Drive](https://drive.google.com/drive/folders/1o9fbdV-gSAqRUw8gA0AnbUHjLxd9Vg0U) under the same folder structure.
-
-## Phase 2: Classification
-
-Phase 2 merges student databases, classifies project types by file extension, builds model-ready input text, and assigns ISIC Rev. 5 division codes to each project.
-
-### Student metadata merge
+### Merge student databases
 
 ```bash
 python phase_2/setup_student_metadata.py --in-dir data/student_metadata --combined-db 23727550-sq26-combined.db
 ```
 
-### Classification preparation (Milestone 3)
-
-Classifies projects by file extension rules and builds `classification_inputs`:
+### Prepare classification
 
 ```bash
 python phase_2/prepare_classification.py --db 23727550-sq26-combined.db
 python phase_2/check_classification_preparation.py --db 23727550-sq26-combined.db
 ```
 
-### ISIC classification (Milestone 4)
-
-**Dry-run test (no API key required):**
+### Run ISIC classification
 
 ```bash
-python phase_2/run_isic_classification.py --db 23727550-sq26-combined.db --provider local-dry-run --limit 20 --overwrite
-python phase_2/check_isic_classification.py --db 23727550-sq26-combined.db
-```
-
-**OpenAI test (20 projects):**
-
-```bash
-export OPENAI_API_KEY="..."
 python phase_2/run_isic_classification.py \
   --db 23727550-sq26-combined.db \
   --provider openai \
-  --model gpt-4o-mini \
-  --limit 20 \
-  --overwrite
+  --model gpt-4.1-mini \
+  --concurrency 3 \
+  --adaptive-concurrency \
+  --min-concurrency 2 \
+  --max-concurrency 10 \
+  --adjustment-window 100 \
+  --resume-across-models
 ```
 
-**Full OpenAI project classification:**
+This command is resumable: rerunning it continues an interrupted run and
+skips any project already classified successfully by an accepted model
+(`--resume-across-models`), rather than reclassifying from scratch. A
+`--provider local-dry-run` mode is also available for testing the pipeline
+without an OpenAI API key.
+
+### Validate
 
 ```bash
-python phase_2/run_isic_classification.py --db 23727550-sq26-combined.db --provider openai --model gpt-4o-mini
+python phase_2/check_isic_classification.py --db 23727550-sq26-combined.db \
+  --combined-methods openai:gpt-4.1-mini,openai:gpt-4o-mini
 ```
 
-**Validate results:**
-
-```bash
-python phase_2/check_isic_classification.py --db 23727550-sq26-combined.db
-```
-
-### Regenerating all outputs
-
-After running the classifier — at any later time, from any point of progress — one command regenerates every derived report and export from the current database state: evaluation CSVs, figures, both project classification XLSX tables (classified-only and full), the PDF report, and all validation CSVs.
-
-```bash
-python phase_2/regenerate_all_outputs.py --db 23727550-sq26-combined.db
-```
-
-or equivalently:
+### Regenerate all outputs
 
 ```bash
 ./regenerate_outputs.sh
 ```
 
-This command only reads the database and rewrites files under `reports/` — it does **not** rerun model classification (no API calls are made) and does not modify the database. Run it any time you want the reports to reflect the latest classification progress. Pass `--dry-run` to see the planned stages and output paths without touching any file, or `--continue-on-error` to run every stage and report all failures at the end instead of stopping at the first one.
+Regenerates every derived artifact from the current database state in one
+command: evaluation reports, figures, both XLSX classification tables, the
+PDF report, and all validation artifacts. It never reruns OpenAI
+classification and never makes an API call — it only reads the database and
+rewrites files under `reports/`. Pass `--dry-run` to preview the planned
+stages without touching any file, or `--continue-on-error` to run every
+stage and report all failures at the end instead of stopping at the first
+one.
+
+## Project Structure
+
+```
+config.py                # keywords, extensions, REPOS list, resilience settings
+harvest.py                # Phase 1 entry point
+harvesters.py             # OAI-PMH / Dataverse connectors
+db.py                     # Phase 1 schema and writes
+phase_2/                  # merge, classification, validation, evaluation, reporting
+data/                     # manifests, reference data, per-student metadata
+reports/                  # generated deliverables (not committed)
+downloads/                # downloaded project files
+docs/                     # architecture notes
+regenerate_outputs.sh     # regenerate all Phase 2 outputs
+```
+
+## Outputs
+
+- Per-student and combined SQLite databases
+- PDF classification report (with table of contents, charts, and tables)
+- XLSX classification tables (classified-only and full)
+- Evaluation CSVs (coverage, confidence, model agreement, throughput)
+- Figures (division distribution, confidence, coverage, model agreement)
+
+## Technologies
+
+- Python
+- SQLite
+- OpenAI API
+- Matplotlib
+- pypdf
+- OpenPyXL
+- tqdm
+- Requests
+
+## Notes
+
+- The OpenAI API key is read from `.env` (never committed).
+- Generated reports and exports under `reports/` are intentionally not
+  committed; they are reproducible from the database.
+- The SQLite database is the single source of truth for all deliverables.
+- Report and export regeneration is deterministic given the same database
+  state — running it twice without new classification results produces
+  identical output.
