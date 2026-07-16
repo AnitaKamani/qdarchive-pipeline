@@ -14,6 +14,7 @@ existing generator scripts:
     build_final_deliverables.py            validate_selection(),
                                             reopen_verify_xlsx(), reopen_verify_pdf()
     check_isic_classification.py           run_checks(), run_combined_checks()
+    export_google_form_repository_summary.py  run()
 
 Every one of those functions was already written as a plain, side-effect-
 scoped Python function returning structured data (not just a CLI entry
@@ -51,6 +52,7 @@ Options:
     --skip-figures             skip regenerating reports/figures/
     --skip-xlsx                skip regenerating both XLSX variants
     --skip-pdf                 skip regenerating the PDF report
+    --skip-google-form-summary skip regenerating the Google Form repository summary CSV/TXT
     --skip-validation          skip refreshing isic_classification_validation.csv /
                                 isic_combined_coverage.csv (the reopen-verify step
                                 and the pre-flight selection check always still run)
@@ -76,6 +78,7 @@ if str(_here) not in sys.path:
 import build_final_deliverables as deliverables
 import check_isic_classification as classification_checks
 import evaluate_isic_results
+import export_google_form_repository_summary as google_form_exporter
 import export_project_classification_table as xlsx_exporter
 import generate_project_classification_report as pdf_reporter
 import plot_isic_evaluation
@@ -211,9 +214,10 @@ def _print_plan(paths: dict[str, Path], args: argparse.Namespace) -> None:
         ("4. Classified-only XLSX", args.skip_xlsx, "export_project_classification_table.run(include_unclassified=False)"),
         ("5. Full XLSX (incl. unclassified)", args.skip_xlsx, "export_project_classification_table.run(include_unclassified=True)"),
         ("6. PDF report", args.skip_pdf, "generate_project_classification_report.generate_report()"),
-        ("7. Classification validation refresh", args.skip_validation, "check_isic_classification.run_checks()/run_combined_checks()"),
-        ("8. Reopen + verify XLSX/PDF", False, "build_final_deliverables.reopen_verify_xlsx()/reopen_verify_pdf()"),
-        ("9. Final PASS/FAIL summary", False, "(printed by this script)"),
+        ("7. Google Form repository summary", args.skip_google_form_summary, "export_google_form_repository_summary.run()"),
+        ("8. Classification validation refresh", args.skip_validation, "check_isic_classification.run_checks()/run_combined_checks()"),
+        ("9. Reopen + verify XLSX/PDF", False, "build_final_deliverables.reopen_verify_xlsx()/reopen_verify_pdf()"),
+        ("10. Final PASS/FAIL summary", False, "(printed by this script)"),
     ]
     for label, skip, call in plan:
         marker = "SKIP" if skip else "RUN "
@@ -242,6 +246,7 @@ def main() -> None:
     parser.add_argument("--skip-figures", action="store_true")
     parser.add_argument("--skip-xlsx", action="store_true")
     parser.add_argument("--skip-pdf", action="store_true")
+    parser.add_argument("--skip-google-form-summary", action="store_true")
     parser.add_argument("--skip-validation", action="store_true")
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -264,6 +269,9 @@ def main() -> None:
         "table validation CSV": reports_dir / "project_classification_table_validation.csv",
         "full-table validation CSV": reports_dir / "project_classification_table_full_validation.csv",
         "report validation CSV": reports_dir / "project_classification_report_validation.csv",
+        "Google Form summary CSV": reports_dir / f"{args.student_id}-sq26-google-form-summary.csv",
+        "Google Form summary TXT": reports_dir / f"{args.student_id}-sq26-google-form-summary.txt",
+        "Google Form summary validation CSV": reports_dir / "google_form_repository_summary_validation.csv",
         "classification validation CSV": reports_dir / "isic_classification_validation.csv",
         "combined coverage CSV": reports_dir / "isic_combined_coverage.csv",
     }
@@ -361,6 +369,19 @@ def main() -> None:
         context["pdf_result"] = result
         return checks
 
+    def stage_google_form_summary() -> list[dict]:
+        _, checks, link_warnings = google_form_exporter.run(
+            db_path=str(db_path),
+            output_csv=str(paths["Google Form summary CSV"]),
+            output_txt=str(paths["Google Form summary TXT"]),
+            preferred_method=DEFAULT_PREFERRED_METHOD,
+            fallback_method=DEFAULT_FALLBACK_METHOD,
+            validation_report_path=paths["Google Form summary validation CSV"],
+        )
+        for w in link_warnings:
+            checks.append({"check": "database_link resolved", "status": "INFO", "detail": w})
+        return checks
+
     def stage_classification_validation() -> list[dict]:
         checks_a = classification_checks.run_checks(str(db_path))
         _write_checks_csv(paths["classification validation CSV"], checks_a)
@@ -402,9 +423,11 @@ def main() -> None:
                                   args.continue_on_error, stage_log, stage_xlsx_full) or []
         all_checks += _run_stage("6. PDF report", args.skip_pdf,
                                   args.continue_on_error, stage_log, stage_pdf) or []
-        all_checks += _run_stage("7. Classification validation refresh", args.skip_validation,
+        all_checks += _run_stage("7. Google Form repository summary", args.skip_google_form_summary,
+                                  args.continue_on_error, stage_log, stage_google_form_summary) or []
+        all_checks += _run_stage("8. Classification validation refresh", args.skip_validation,
                                   args.continue_on_error, stage_log, stage_classification_validation) or []
-        all_checks += _run_stage("8. Reopen + verify XLSX/PDF", False,
+        all_checks += _run_stage("9. Reopen + verify XLSX/PDF", False,
                                   args.continue_on_error, stage_log, stage_reopen_verify) or []
     except StageError as exc:
         aborted_at = str(exc)
@@ -420,7 +443,7 @@ def main() -> None:
     total_elapsed = time.perf_counter() - run_t0
 
     print(f"\n{'=' * 64}")
-    print("9. Final Summary")
+    print("10. Final Summary")
     print("=" * 64)
     print(f"  finished    : {_now_str()} (local time)")
     print(f"  total time  : {total_elapsed:.2f}s")
