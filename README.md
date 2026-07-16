@@ -50,7 +50,7 @@ Harvest → Normalize → Project-type classification → Per-student SQLite dat
 
 ```
 Merge student databases → Classification preparation → OpenAI ISIC classification
-  → Validation → Evaluation → PDF / XLSX / Google Form outputs
+  → Validation → Evaluation → PDF / XLSX outputs
 ```
 
 ## Main Commands
