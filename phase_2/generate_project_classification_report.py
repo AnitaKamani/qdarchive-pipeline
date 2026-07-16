@@ -59,6 +59,7 @@ import matplotlib.font_manager as font_manager
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.textpath import TextPath
 from matplotlib.ticker import FuncFormatter
 
 from project_classification_data import (
@@ -79,8 +80,8 @@ TOP_N_DEFAULT = 20
 CHART_TOP_N = 12  # bar charts show fewer classes than the table so wrapped labels stay readable at reduced size
 STUDENT_ID = "23727550"
 AUTHOR = "Fatemeh Kamani"
-SUPERVISOR = "Prof. Riehle"
-REPORT_DATE = "July 2026"
+SUPERVISOR = "Dr. Prof. Riehle"
+REPORT_DATE = "Summer 2026"
 
 # Table-of-contents layout: readable body-text size (never a tiny footnote
 # size) and a comfortable leading, both in points so the row budget below
@@ -236,6 +237,39 @@ def _wrap_label(text: str, width: int, max_lines: int = 2) -> str:
         last = last[: width - 1].rstrip()
     kept[-1] = last + "…"
     return "\n".join(kept)
+
+
+def _text_width_pt(text: str, fontsize: float) -> float:
+    """The rendered width, in points, of `text` set in RESOLVED_FONT_FAMILY
+    at `fontsize` — measured from the actual glyph metrics (via TextPath)
+    rather than an approximate character count, so wrapping decisions are
+    correct for a proportional font regardless of which characters appear."""
+    if not text:
+        return 0.0
+    return TextPath((0, 0), text, size=fontsize, prop=font_manager.FontProperties(family=RESOLVED_FONT_FAMILY)).get_extents().width
+
+
+def _wrap_by_width(text: str, max_width_pt: float, fontsize: float) -> list[str]:
+    """Greedy word-wrap using real measured widths: a word is added to the
+    current line only if the line still fits `max_width_pt`; otherwise it
+    starts a new line. Never drops or truncates any word, so the full label
+    is always shown regardless of length — there is no line cap and no
+    ellipsis. Works for any label text (not tuned to specific class names),
+    so it applies equally to ISIC divisions not present in today's data."""
+    words = text.split()
+    if not words:
+        return [""]
+    lines: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        if _text_width_pt(candidate, fontsize) <= max_width_pt:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
 
 
 def _leading(axes_height_fraction: float, points: float) -> float:
@@ -569,30 +603,96 @@ def build_global_summary_pages(global_stats: dict, titles: dict[str, str],
     return pages
 
 
-def _build_bar_chart_axes(ax, class_counts: Counter, titles: dict[str, str], top_n: int, label_width: int = 32) -> None:
+CHART_LABEL_FONTSIZE_MAX = 9.5
+CHART_LABEL_FONTSIZE_MIN = 9.0  # hard floor: never render class-name labels smaller than this
+CHART_LABEL_COL_PAD_PT = 6  # breathing room between the wrapped label text and the plot area
+CHART_ROW_LINE_LEADING = 1.28  # line-height multiplier for multi-line wrapped labels
+CHART_ROW_GAP_FRACTION = 0.45  # extra gap between rows, as a fraction of one label line's height
+
+
+def _build_bar_chart_axes(ax, class_counts: Counter, titles: dict[str, str], top_n: int) -> None:
+    """Horizontal bar chart with full, never-truncated ISIC class-name
+    labels drawn to the left of the plot. The label column's width is read
+    directly from this axes' own figure position (set by the caller via
+    fig.add_axes(...)), so wrapping is always based on the real available
+    width rather than a hardcoded character count — this works unchanged
+    for any class name, present or future.
+
+    Row height is uniform across the chart (matplotlib's categorical bar
+    spacing default) but sized to whichever label in *this* chart needs the
+    most lines, so long labels never overlap the row above or below. Font
+    size only drops (down to the CHART_LABEL_FONTSIZE_MIN floor) if the
+    longest label would otherwise need more than 4 wrapped lines at the
+    available column width.
+    """
+    fig = ax.figure
     top = class_counts.most_common(top_n)
     total_classified = sum(class_counts.values())
     plotted = list(reversed(top))
-    labels = [_wrap_label(isic_label(code, titles), label_width) for code, _ in plotted]
+    raw_labels = [isic_label(code, titles) for code, _ in plotted]
     counts = [c for _, c in plotted]
     pcts = [c / total_classified * 100 for c in counts]
+    n_rows = len(plotted)
+
+    # The label column is whatever figure-fraction space sits between the
+    # page's own left margin and this axes' left edge — computed from the
+    # axes' real position, not a parameter the caller has to keep in sync.
+    ax_bbox = ax.get_position()
+    label_col_width_in = max(0.1, (ax_bbox.x0 - CONTENT_LEFT) * PAGE_SIZE[0])
+    max_width_pt = label_col_width_in * 72 - CHART_LABEL_COL_PAD_PT
+
+    fontsize = CHART_LABEL_FONTSIZE_MAX
+    wrapped: list[list[str]] = []
+    max_lines = 1
+    while True:
+        wrapped = [_wrap_by_width(lbl, max_width_pt, fontsize) for lbl in raw_labels]
+        max_lines = max((len(w) for w in wrapped), default=1)
+        if fontsize <= CHART_LABEL_FONTSIZE_MIN or max_lines <= 4:
+            break
+        fontsize = max(CHART_LABEL_FONTSIZE_MIN, fontsize - 0.25)
+
+    # Uniform row pitch sized for the tallest wrapped label in this chart,
+    # expressed in abstract "line units" (the numeric scale is arbitrary —
+    # only the ratios matter — so this need not match points/inches).
+    row_unit = max_lines + CHART_ROW_GAP_FRACTION
+    y_centers = [row_unit * (i + 0.5) for i in range(n_rows)]
+    total_units = row_unit * n_rows
+    bar_thickness = max_lines * 0.62
 
     max_count = max(counts) or 1
     colors = [SEQUENTIAL_BLUE(0.25 + 0.75 * (c / max_count)) for c in counts]
-    bars = ax.barh(labels, counts, color=colors, height=0.58, zorder=3)
+    bars = ax.barh(y_centers, counts, height=bar_thickness, color=colors, zorder=3)
+    ax.set_ylim(0, total_units)
+    ax.set_yticks([])  # replaced below by manually placed, left-aligned multi-line labels
+
     _style_axes(ax)
     ax.xaxis.grid(True, color=GRIDLINE, linewidth=1, zorder=0)
     ax.set_axisbelow(True)
     ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{int(v):,}"))
     ax.set_xlabel("Classified projects", fontsize=9.5)
-    ax.tick_params(axis="y", labelsize=8.7)
-    ax.tick_params(axis="x", labelsize=8.7)
+    ax.tick_params(axis="x", labelsize=9.0)
 
     max_x = max(counts)
     for bar, count, pct in zip(bars, counts, pcts):
         ax.text(bar.get_width() + max_x * 0.02, bar.get_y() + bar.get_height() / 2,
-                f"{count:,} ({pct:.1f}%)", va="center", ha="left", fontsize=8.2, color=INK_SECONDARY)
+                f"{count:,} ({pct:.1f}%)", va="center", ha="left", fontsize=8.5, color=INK_SECONDARY,
+                clip_on=False)
     ax.set_xlim(0, max_x * 1.28)
+
+    # Each label is drawn as its own figure-level text block, anchored flush
+    # left at the page's standard content margin (never centered, never
+    # right-aligned) with multialignment="left" so every wrapped line starts
+    # at the same left edge rather than being centered under a shorter line
+    # above/below it.
+    for y_center, lines in zip(y_centers, wrapped):
+        fig_y = ax_bbox.y0 + (y_center / total_units) * ax_bbox.height
+        # va="center" anchors the whole multi-line block at its own vertical
+        # midpoint, matching the bar it labels regardless of line count.
+        fig.text(
+            CONTENT_LEFT, fig_y, "\n".join(lines),
+            fontsize=fontsize, color=INK_PRIMARY, va="center", ha="left",
+            multialignment="left", linespacing=CHART_ROW_LINE_LEADING,
+        )
 
 
 def _build_bar_chart_page(class_counts: Counter, titles: dict[str, str], top_n: int,
@@ -603,13 +703,18 @@ def _build_bar_chart_page(class_counts: Counter, titles: dict[str, str], top_n: 
         return None
 
     fig = plt.figure(figsize=PAGE_SIZE)
-    chart_left = CONTENT_LEFT + CONTENT_WIDTH * 0.30
+    # Label column widened (was 0.30) and chart height increased (was 0.62)
+    # versus the original fixed-width/fixed-height layout, so full
+    # (never-truncated) wrapped ISIC titles have enough room without
+    # crowding the bars — the two levers this file's docstring calls out
+    # first when a label needs more space.
+    chart_left = CONTENT_LEFT + CONTENT_WIDTH * 0.36
     chart_width = CONTENT_RIGHT - chart_left
-    chart_height = CONTENT_HEIGHT * 0.62  # ~25-30% smaller than the prior full-content-height chart
+    chart_height = CONTENT_HEIGHT * 0.74
     chart_top = CONTENT_TOP - 0.08  # anchored just below the title/subtitle, not centered in the page
     chart_bottom = chart_top - chart_height
     ax = fig.add_axes([chart_left, chart_bottom, chart_width, chart_height])
-    _build_bar_chart_axes(ax, class_counts, titles, top_n, label_width=30)
+    _build_bar_chart_axes(ax, class_counts, titles, top_n)
 
     fig.text(0.5, CONTENT_TOP - 0.01, chart_title, fontsize=13, fontweight="bold", ha="center", color=INK_PRIMARY)
     fig.text(0.5, CONTENT_TOP - 0.035, subtitle, fontsize=9, ha="center", color=INK_MUTED)
@@ -704,7 +809,9 @@ def _build_table_and_comments_page(page_title: str, class_counts: Counter, title
 
 def build_repository_pages(repo_id: int, stats: dict, titles: dict[str, str], top_n: int) -> list[plt.Figure]:
     fig = plt.figure(figsize=PAGE_SIZE)
-    text_h = CONTENT_HEIGHT * 0.30
+    # Slightly shorter than before (was 0.30) to give the chart below a bit
+    # more height, per the same two levers as _build_bar_chart_page.
+    text_h = CONTENT_HEIGHT * 0.26
     text_ax = fig.add_axes([CONTENT_LEFT, CONTENT_TOP - text_h, CONTENT_WIDTH, text_h])
     text_ax.axis("off")
     text_ax.text(0.0, 0.97, f"Repository {repo_id}", transform=text_ax.transAxes, fontsize=16,
@@ -716,9 +823,9 @@ def build_repository_pages(repo_id: int, stats: dict, titles: dict[str, str], to
     if has_chart:
         chart_top = CONTENT_TOP - text_h - 0.03
         chart_height = chart_top - CONTENT_BOTTOM
-        chart_left = CONTENT_LEFT + CONTENT_WIDTH * 0.32
+        chart_left = CONTENT_LEFT + CONTENT_WIDTH * 0.37  # widened label column (was 0.32)
         chart_ax = fig.add_axes([chart_left, CONTENT_BOTTOM, CONTENT_RIGHT - chart_left, chart_height])
-        _build_bar_chart_axes(chart_ax, stats["class_counts"], titles, top_n=CHART_TOP_N, label_width=28)
+        _build_bar_chart_axes(chart_ax, stats["class_counts"], titles, top_n=CHART_TOP_N)
         fig.text(
             0.5, chart_top + 0.012,
             f"Top {min(CHART_TOP_N, len(stats['class_counts']))} Primary ISIC Classes — Repository {repo_id}",
