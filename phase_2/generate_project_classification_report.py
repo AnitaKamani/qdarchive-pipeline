@@ -98,8 +98,9 @@ def _repo_anchor(repo_id: int) -> str:
     characters a PDF name/destination can't safely carry."""
     return "repository_" + re.sub(r"[^0-9a-zA-Z_]+", "_", str(repo_id))
 
-# A4 portrait, inches, with standard 1-inch margins on every page.
-PAGE_SIZE = (8.27, 11.69)
+# A4 portrait (210mm x 297mm), computed from the true millimetre definition
+# rather than a rounded inch value, with exact 1-inch margins on every page.
+PAGE_SIZE = (210 / 25.4, 297 / 25.4)
 MARGIN_IN = 1.0
 CONTENT_LEFT = MARGIN_IN / PAGE_SIZE[0]
 CONTENT_RIGHT = 1 - MARGIN_IN / PAGE_SIZE[0]
@@ -108,6 +109,23 @@ CONTENT_TOP = 1 - MARGIN_IN / PAGE_SIZE[1]
 CONTENT_WIDTH = CONTENT_RIGHT - CONTENT_LEFT
 CONTENT_HEIGHT = CONTENT_TOP - CONTENT_BOTTOM
 FOOTER_Y = 0.4 / PAGE_SIZE[1]  # 0.4in from the bottom edge, inside the margin band
+
+# Every body-text frame (Methodology, Limitations, Findings, repository
+# descriptions) is drawn into an axes spanning exactly CONTENT_WIDTH, so this
+# one constant is the true text-frame width in points on every page that uses
+# it: page width minus the left and right one-inch margins, nothing else.
+BODY_TEXT_WIDTH_PT = CONTENT_WIDTH * PAGE_SIZE[0] * 72
+# Line/paragraph spacing is a fixed multiple of whichever fontsize a section
+# uses, so leading is visually consistent everywhere even though Findings
+# blocks under a table use a smaller fontsize than Methodology/Limitations.
+BODY_LINE_LEADING_RATIO = 1.4
+BODY_PARA_GAP_RATIO = 0.9
+BULLET_INDENT_PT = 14.0  # hanging indent for wrapped bullet continuation lines
+# A glyph's ink bounding box can extend very slightly past its nominal
+# advance width (e.g. right-side bearing on the last character of a line);
+# reserving a few points guarantees a justified line's rendered ink never
+# creeps past the true margin, confirmed empirically against real report text.
+BODY_JUSTIFY_SAFETY_PT = 3.0
 
 # --- Palette: a single consistent blue family throughout the report ---
 SURFACE = "#fcfcfb"
@@ -315,49 +333,80 @@ def _draw_lines(ax, x: float, y: float, lines: list[str], fontsize: float = 11,
     return y
 
 
-def _wrap_paragraph_balanced(text: str, width: int) -> list[str]:
-    """Word-wrap like textwrap.wrap, but avoid leaving a short "widow" line
-    (e.g. one lone short word) at the end of a paragraph. textwrap's greedy
-    fill picks break points purely by character count, which can strand a
-    short remainder on its own final line; trying slightly narrower widths
-    that still produce the same number of lines often finds a break point
-    where the last line fills a reasonable share of the column instead."""
-    lines = textwrap.wrap(text, width=width) or [""]
-    if len(lines) <= 1 or len(lines[-1]) >= width * 0.55:
-        return lines
-    for w in range(width - 1, max(width - 12, 20), -1):
-        candidate = textwrap.wrap(text, width=w) or [""]
-        if len(candidate) == len(lines) and len(candidate[-1]) >= width * 0.55:
-            return candidate
-    return lines
+def _draw_justified_line(ax, x0_frac: float, y_frac: float, words: list[str], fontsize: float,
+                          target_width_pt: float, justify: bool, color: str) -> None:
+    """Render one already-wrapped line of words. When `justify` is set, the
+    inter-word gaps are stretched by real glyph-metric measurement (not an
+    assumed fixed space width) so the line's right edge lands exactly on
+    `target_width_pt` — flush with every other justified line on the page.
+    A paragraph's own last line is drawn with `justify=False` at natural
+    spacing and left-aligned, matching standard justified-text behaviour
+    (the same convention ReportLab's TA_JUSTIFY uses)."""
+    if not words:
+        return
+    if not justify or len(words) == 1:
+        ax.text(x0_frac, y_frac, " ".join(words), transform=ax.transAxes, fontsize=fontsize,
+                color=color, va="top", ha="left")
+        return
+
+    word_widths = [_text_width_pt(w, fontsize) for w in words]
+    gap_widths = [
+        _text_width_pt(f"{words[i]} {words[i + 1]}", fontsize) - word_widths[i] - word_widths[i + 1]
+        for i in range(len(words) - 1)
+    ]
+    extra_per_gap = (target_width_pt - sum(word_widths) - sum(gap_widths)) / len(gap_widths)
+
+    x_pt = 0.0
+    for i, word in enumerate(words):
+        ax.text(x0_frac + x_pt / BODY_TEXT_WIDTH_PT, y_frac, word, transform=ax.transAxes,
+                fontsize=fontsize, color=color, va="top", ha="left")
+        if i < len(words) - 1:
+            x_pt += word_widths[i] + gap_widths[i] + extra_per_gap
 
 
-def _draw_paragraphs(ax, x: float, y: float, paragraphs: list[str], fontsize: float = 10.5,
-                      wrap_width: int = 92, line_spacing: float = 0.026, para_gap: float = 0.016) -> float:
-    """Word-wrap each paragraph to `wrap_width` characters (tuned for the
-    default axes width and font), rebalanced to avoid short widow lines, and
-    render one line per matplotlib text call so long sentences never run off
-    the page edge. Left-aligned throughout — never centered."""
+def _draw_paragraphs(ax, y: float, paragraphs: list[str], ax_height_frac: float,
+                      fontsize: float = 10.5, color: str | None = None) -> float:
+    """Justified paragraph engine: each paragraph is word-wrapped to the true
+    shared content width (BODY_TEXT_WIDTH_PT, measured from real glyph
+    metrics, not a character-count guess), every line but a paragraph's last
+    is stretched flush to both margins, and the last line is left-aligned.
+    Line and paragraph spacing both scale with `fontsize` at a fixed ratio,
+    so spacing reads as consistent regardless of which section calls this."""
+    color = color or INK_PRIMARY
+    line_leading = _leading(ax_height_frac, fontsize * BODY_LINE_LEADING_RATIO)
+    para_gap = _leading(ax_height_frac, fontsize * BODY_PARA_GAP_RATIO)
+    target_width_pt = BODY_TEXT_WIDTH_PT - BODY_JUSTIFY_SAFETY_PT
     for para in paragraphs:
-        for line in _wrap_paragraph_balanced(para, wrap_width):
-            ax.text(x, y, line, transform=ax.transAxes, fontsize=fontsize, color=INK_PRIMARY, va="top", ha="left")
-            y -= line_spacing
+        lines = _wrap_by_width(para, target_width_pt, fontsize)
+        for i, line in enumerate(lines):
+            is_last = i == len(lines) - 1
+            _draw_justified_line(ax, 0.0, y, line.split(), fontsize, target_width_pt,
+                                  justify=not is_last, color=color)
+            y -= line_leading
         y -= para_gap
     return y
 
 
-def _draw_bullets(ax, x: float, y: float, items: list[str], fontsize: float = 10.5,
-                   wrap_width: int = 88, line_spacing: float = 0.026, bullet_gap: float = 0.016) -> float:
-    """Word-wrap each bullet item, indenting continuation lines under the
-    bullet marker rather than restarting at the margin."""
-    continuation_indent = "   "
+def _draw_bullets(ax, y: float, items: list[str], ax_height_frac: float,
+                   fontsize: float = 10.5, color: str | None = None) -> float:
+    """Justified bullet list on the same shared content width: continuation
+    lines hang-indent under the bullet marker by BULLET_INDENT_PT, wrap by
+    real glyph metrics, and justify every line but an item's last."""
+    color = color or INK_PRIMARY
+    line_leading = _leading(ax_height_frac, fontsize * BODY_LINE_LEADING_RATIO)
+    bullet_gap = _leading(ax_height_frac, fontsize * BODY_PARA_GAP_RATIO)
+    indent_frac = BULLET_INDENT_PT / BODY_TEXT_WIDTH_PT
+    available_pt = BODY_TEXT_WIDTH_PT - BULLET_INDENT_PT - BODY_JUSTIFY_SAFETY_PT
     for item in items:
-        wrapped = textwrap.wrap(item, width=wrap_width) or [""]
-        for i, line in enumerate(wrapped):
-            prefix = "•  " if i == 0 else continuation_indent
-            ax.text(x, y, prefix + line, transform=ax.transAxes, fontsize=fontsize, color=INK_PRIMARY,
-                     va="top", ha="left")
-            y -= line_spacing
+        lines = _wrap_by_width(item, available_pt, fontsize)
+        for i, line in enumerate(lines):
+            if i == 0:
+                ax.text(0.0, y, "•", transform=ax.transAxes, fontsize=fontsize, color=color,
+                        va="top", ha="left")
+            is_last = i == len(lines) - 1
+            _draw_justified_line(ax, indent_frac, y, line.split(), fontsize, available_pt,
+                                  justify=not is_last, color=color)
+            y -= line_leading
         y -= bullet_gap
     return y
 
@@ -507,8 +556,7 @@ def build_methodology_page(preferred_method: str, fallback_method: str) -> plt.F
         "statistics below: coverage and remaining-unclassified counts are reported for every repository "
         "and for the archive as a whole.",
     ]
-    _draw_paragraphs(ax, 0.0, 0.94, paragraphs, fontsize=10.5, wrap_width=92,
-                      line_spacing=_leading(CONTENT_HEIGHT, 15), para_gap=_leading(CONTENT_HEIGHT, 9))
+    _draw_paragraphs(ax, 0.94, paragraphs, CONTENT_HEIGHT, fontsize=10.5)
     return fig
 
 
@@ -787,8 +835,7 @@ def _build_table_and_comments_page(page_title: str, class_counts: Counter, title
         # via _leading against this axes' own height, not a fixed fraction
         # of it, which would otherwise stretch into a large blank gap here.
         bullets_start_y = 1.0 - _leading(findings_height, 18)
-        end_y = _draw_bullets(comments_ax, 0.0, bullets_start_y, comments, fontsize=9.3, wrap_width=104,
-                              line_spacing=_leading(findings_height, 12), bullet_gap=_leading(findings_height, 6))
+        end_y = _draw_bullets(comments_ax, bullets_start_y, comments, findings_height, fontsize=9.3)
         fits = end_y >= -0.02
 
     if fits:
@@ -802,8 +849,7 @@ def _build_table_and_comments_page(page_title: str, class_counts: Counter, title
     findings_fig, findings_ax = _new_page()
     findings_ax.text(0.0, 0.98, "Findings", transform=findings_ax.transAxes, fontsize=15,
                       fontweight="bold", va="top", color=INK_PRIMARY)
-    _draw_bullets(findings_ax, 0.0, 0.90, comments, fontsize=10.5, wrap_width=92,
-                  line_spacing=_leading(CONTENT_HEIGHT, 15), bullet_gap=_leading(CONTENT_HEIGHT, 9))
+    _draw_bullets(findings_ax, 0.90, comments, CONTENT_HEIGHT, fontsize=10.5)
     return [fig, findings_fig]
 
 
@@ -844,9 +890,7 @@ def build_repository_pages(repo_id: int, stats: dict, titles: dict[str, str], to
         no_data_ax.text(0.0, 1.0, "Findings", transform=no_data_ax.transAxes, fontsize=13, fontweight="bold",
                          va="top", color=INK_PRIMARY)
         comments = generate_comments(stats, titles)
-        _draw_bullets(no_data_ax, 0.0, 0.90, comments, fontsize=10.5, wrap_width=92,
-                      line_spacing=_leading(CONTENT_TOP - text_h - CONTENT_BOTTOM, 16),
-                      bullet_gap=_leading(CONTENT_TOP - text_h - CONTENT_BOTTOM, 9))
+        _draw_bullets(no_data_ax, 0.90, comments, CONTENT_TOP - text_h - CONTENT_BOTTOM, fontsize=10.5)
 
     return pages
 
@@ -873,8 +917,7 @@ def build_limitations_page() -> plt.Figure:
         "across students. Repository sections here should be read as processing groupings rather than "
         "a canonical list of distinct external archives.",
     ]
-    _draw_bullets(ax, 0.0, 0.90, points, fontsize=10.5, wrap_width=92,
-                  line_spacing=_leading(CONTENT_HEIGHT, 15), bullet_gap=_leading(CONTENT_HEIGHT, 9))
+    _draw_bullets(ax, 0.90, points, CONTENT_HEIGHT, fontsize=10.5)
     return fig
 
 
